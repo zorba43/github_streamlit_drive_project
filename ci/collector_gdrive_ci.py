@@ -1,7 +1,8 @@
 # ci/collector_gdrive_ci.py
 # Drive -> data/raw/ indirir; her Excel'i satır satır NORMALIZE edip
 # data/normalized/<slug>.csv (çok satır) yazar. Her çalıştırmada raw/ ve
-# normalized/ temizlenir. Sadece HÜCRE değerleri okunur (header'dan sayı çekilmez).
+# normalized/ temizlenir. 24H/Week/Month/RTP değerleri ETİKETTEN SONRAKİ
+# sayıya göre çıkarılır (header'dan sayı çekilmez).
 
 import os, io, re, json, argparse, unicodedata
 import pandas as pd
@@ -81,11 +82,6 @@ def slugify(text):
     text = re.sub(r"[^A-Za-z0-9._-]+","-", text).strip("-")
     return text or "file"
 
-def parse_num(v):
-    if v is None: return None
-    m = re.search(r"([-+]?\d+(?:\.\d+)?)", str(v))
-    return float(m.group(1)) if m else None
-
 def match_col(cols, *keys):
     """Kolon adlarını boşluksuz/küçük harf karşılaştır; olası varyasyonları yakala."""
     keys = [k.replace(" ", "").lower() for k in keys]
@@ -97,10 +93,8 @@ def match_col(cols, *keys):
 
 def detect_timestamp_col(df):
     cols = list(df.columns)
-    # isimden dene
     c = match_col(cols, "time","date","tarih","zaman","timestamp")
     if c: return c
-    # en çok datetime'a dönüşen sütun
     best = None; best_count = -1
     for c in cols:
         s = pd.to_datetime(df[c], errors="coerce", dayfirst=True, utc=False)
@@ -108,6 +102,51 @@ def detect_timestamp_col(df):
         if good > best_count:
             best_count = good; best = c
     return best or cols[-1]
+
+def parse_metric(cell_value, label):
+    """
+    Hücre metninden 'label' (örn. 24h / week / month / rtp) etiketini temizleyip
+    SONRASINDAKİ ilk sayıyı döndürür. Virgül ondalık, % işareti, satır sonu vb. desteklenir.
+    """
+    if cell_value is None:
+        return None
+    s = str(cell_value).strip()
+    if not s:
+        return None
+
+    # normalize decimal commas and whitespace
+    s = s.replace(",", ".")
+    s = re.sub(r"\s+", " ", s)
+
+    label = label.lower()
+    # farklı yazımlar için olası label kalıpları
+    patterns = {
+        "24h":  [r"24\s*h", r"24hours?", r"24\s*saat"],
+        "week": [r"week", r"1w", r"7d", r"last\s*7", r"7\s*g[uü]n"],
+        "month":[r"month", r"1m", r"30d", r"last\s*30", r"30\s*g[uü]n"],
+        "rtp":  [r"rtp", r"return\s*to\s*player"]
+    }.get(label, [re.escape(label)])
+
+    # 1) etiketten SONRA gelen sayı
+    for pat in patterns:
+        m = re.search(pat + r"[^0-9\-+]*([-+]?\d+(?:\.\d+)?)", s, flags=re.I)
+        if m:
+            try:
+                return float(m.group(1))
+            except Exception:
+                pass
+
+    # 2) etiket varsa tamamen temizleyip ilk sayıyı al (yine label'daki '24' yakalanmasın diye)
+    for pat in patterns:
+        s = re.sub(pat, " ", s, flags=re.I)
+    m2 = re.search(r"([-+]?\d+(?:\.\d+)?)", s)
+    if m2:
+        try:
+            return float(m2.group(1))
+        except Exception:
+            pass
+
+    return None
 
 def normalize_dataframe(df, source_path):
     cols = list(df.columns)
@@ -121,7 +160,7 @@ def normalize_dataframe(df, source_path):
             from os.path import basename, splitext
             game_name = splitext(basename(source_path))[0]
 
-    # Kolon eşleştirme (SADECE hücre değerleri okunacak)
+    # Kolon eşleştirme
     ts_col  = detect_timestamp_col(df)
     c_24h   = match_col(cols, "24h", "last24h", "24hours", "24saat")
     c_week  = match_col(cols, "week", "1w", "7d", "last7d", "7gun", "7gün")
@@ -136,16 +175,16 @@ def normalize_dataframe(df, source_path):
         if pd.isna(ts):
             continue
 
-        def val(col):
-            return parse_num(df.iloc[i][col]) if (col in df.columns and col is not None) else None
+        def val(col, lbl):
+            return parse_metric(df.iloc[i][col], lbl) if (col in df.columns and col is not None) else None
 
         rec = {
             "timestamp": ts,
             "game": game_name,
-            "24H":   val(c_24h),
-            "Week":  val(c_week),
-            "Month": val(c_month),
-            "RTP":   val(c_rtp),
+            "24H":   val(c_24h,   "24h"),
+            "Week":  val(c_week,  "week"),
+            "Month": val(c_month, "month"),
+            "RTP":   val(c_rtp,   "rtp"),
         }
 
         if any(rec[k] is not None for k in ["24H","Week","Month","RTP"]):
@@ -166,7 +205,6 @@ def main():
     ap.add_argument("--folder-id", required=True, help="Drive Folder ID or full URL")
     args = ap.parse_args()
 
-    # Credentials
     creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
     if creds_path and os.path.exists(creds_path):
@@ -181,12 +219,10 @@ def main():
     folder_id = normalize_folder_id(args.folder_id)
     log(f"Folder: {folder_id}")
 
-    # Klasörleri temizle
     clean_dir("data/raw")
     clean_dir("data/normalized")
     log("Cleaned data/raw and data/normalized")
 
-    # İndir
     items = walk_files(service, folder_id)
     log(f"Found {len(items)} items (including subfolders).")
     downloaded = []
@@ -197,7 +233,6 @@ def main():
             log(f"Downloaded: {it['name']} -> {p}")
     log(f"Excel-like files downloaded: {len(downloaded)}")
 
-    # Normalize (çok satır, sadece hücre değerleri)
     for p in downloaded:
         try:
             df = pd.read_excel(p, sheet_name=0, engine="openpyxl")
