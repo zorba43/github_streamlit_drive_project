@@ -1,5 +1,5 @@
 # app.py
-import os, io, glob, requests, base64
+import os, io, glob, base64, requests
 from pathlib import Path
 from datetime import datetime
 
@@ -16,8 +16,8 @@ def get_secret(key, default=None):
     except Exception:
         return os.environ.get(key, default)
 
-# --- Decision helper (24H vs Week/Month + opsiyonel eşik ve eğim) ---
 def decide_signal(df_row, slope_24h=None, min_gap=0.3):
+    """24H vs Week/Month + opsiyonel eğim ile sinyal üret."""
     r24, r7, r30 = df_row.get("24H"), df_row.get("Week"), df_row.get("Month")
     if any(pd.isna([r24, r7, r30])):
         return "UNKNOWN", "Veri eksik"
@@ -91,7 +91,7 @@ def list_csv_urls(owner, repo, path, branch, headers):
             out[it["name"]] = it.get("download_url") or it.get("url")
     return out
 
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=60)
 def load_csv_from_github(url, headers):
     if url.startswith("https://api.github.com/"):
         r = requests.get(url, headers=headers, timeout=20)
@@ -210,10 +210,11 @@ if plot_df.empty or plot_df[metric].dropna().empty:
     st.info("Seçili filtre/metric için veri yok.")
 else:
     fig = px.line(plot_df, x="timestamp", y=metric, markers=True)
-    # sinyal anını (en güncel timestamp) işaretle
+    # sinyal anını (en güncel timestamp) işaretle (Timestamp -> datetime)
     last_ts = base_sorted["timestamp"].max()
     if pd.notna(last_ts):
-        fig.add_vline(x=last_ts, line_dash="dot")
+        x_val = last_ts.to_pydatetime() if isinstance(last_ts, pd.Timestamp) else last_ts
+        fig.add_vline(x=x_val, line_dash="dot")
     st.plotly_chart(fig, use_container_width=True)
 
 st.divider()
@@ -231,7 +232,6 @@ if run_sim:
     curr_week = float(last_row.get("Week")) if "Week" in last_row else None
     curr_month = float(last_row.get("Month")) if "Month" in last_row else None
 
-    # Güvenlik
     if any(v is None for v in [base_rtp, curr_24h, curr_week, curr_month]):
         st.info("Simülasyon için 24H / Week / Month / RTP sütunları gerekli.")
     else:
@@ -265,21 +265,34 @@ if run_sim:
                     entry_step = k
                 if direction == "down" and (-diff) >= gap15:
                     entry_step = k
-            rows.append({"Adım (15dk)": k, "Zaman": ts_k, "Proj. Week": round(Wk, 3),
-                         "24H (D*)": round(D_star, 3), "Fark (D*-W)": round(diff, 3)})
+            rows.append({
+                "Adım (15dk)": k,
+                "Zaman": ts_k,
+                "Proj. Week": round(Wk, 3),
+                "24H (D*)": round(D_star, 3),
+                "Fark (D*-W)": round(diff, 3)
+            })
 
         sim15_df = pd.DataFrame(rows)
-        st.dataframe(sim15_df[["Adım (15dk)", "Zaman", "Proj. Week", "24H (D*)", "Fark (D*-W)"]],
-                     use_container_width=True, hide_index=True)
+        st.dataframe(
+            sim15_df[["Adım (15dk)", "Zaman", "Proj. Week", "24H (D*)", "Fark (D*-W)"]],
+            use_container_width=True, hide_index=True
+        )
 
         x_col = "Zaman" if sim15_df["Zaman"].notna().any() else "Adım (15dk)"
         fig_sim15 = px.line(sim15_df, x=x_col, y="Proj. Week", markers=True,
                             title="Week projeksiyonu (15 dk adımlar)")
-        fig_sim15.add_hline(y=D_star, line_dash="dot", annotation_text="24H (D*)", annotation_position="top left")
+        fig_sim15.add_hline(y=D_star, line_dash="dot",
+                            annotation_text="24H (D*)", annotation_position="top left")
         if entry_step is not None:
             x_val = sim15_df.loc[entry_step, x_col]
+            if isinstance(x_val, pd.Timestamp):
+                x_val = x_val.to_pydatetime()
             fig_sim15.add_vline(x=x_val, line_dash="dot",
-                                annotation_text=f"Giriş: {entry_step} adım", annotation_position="top right")
+                                annotation_text=f"Giriş: {entry_step} adım",
+                                annotation_position="top right")
+        if x_col == "Zaman":
+            fig_sim15.update_xaxes(type="date")
         st.plotly_chart(fig_sim15, use_container_width=True)
 
         if entry_step is None:
@@ -290,12 +303,13 @@ if run_sim:
             when_text = f", zaman: {eta.strftime('%Y-%m-%d %H:%M')}" if pd.notna(eta) else ""
             st.success(
                 f"✅ 15 dk simülasyonu: **{entry_step} adım** sonra{dur_text}{when_text} giriş yapılabilir. "
-                f"Week ≈ {sim15_df.loc[entry_step, 'Proj. Week']:.2f}, fark ≈ {sim15_df.loc[entry_step, 'Fark (D*-W)']:.2f}."
+                f"Week ≈ {sim15_df.loc[entry_step, 'Proj. Week']:.2f}, "
+                f"fark ≈ {sim15_df.loc[entry_step, 'Fark (D*-W)']:.2f}."
             )
 
         st.markdown("---")
 
-        # ---- B) Saatlik yakınsama (24H/Week/Month → Base RTP) ----
+        # ---- B) Saatlik yakınsama (24H/Week/Month → Orijinal RTP) ----
         st.markdown("**B) Saatlik Yakınsama (Orijinal RTP'ye doğru)**")
         cB1, cB2 = st.columns(2)
         with cB1:
@@ -316,10 +330,10 @@ if run_sim:
 
         figH = px.line(simH_df, x="Saat", y=["24H", "Week", "Month"],
                        title="Saatlik RTP Yakınsama", markers=True)
-        figH.add_hline(y=base_rtp, line_dash="dot", annotation_text="Orijinal RTP", annotation_position="top left")
+        figH.add_hline(y=base_rtp, line_dash="dot",
+                       annotation_text="Orijinal RTP", annotation_position="top left")
         st.plotly_chart(figH, use_container_width=True)
 
-        # Hızlı yorum
         if curr_24h > curr_week and curr_24h > curr_month and curr_24h > base_rtp:
             st.success("✅ Saatlik model: Şu an verme eğiliminde (kısa vadede oynanabilir).")
         else:
