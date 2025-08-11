@@ -1,10 +1,9 @@
-# ci/collector_gdrive_ci.py
-# Drive klasörünü (alt klasörler dahil) data/raw/ içine indirir,
-# sonra her Excel için 24H/Week/Month/RTP + timestamp'ı ayrıştırıp
-# data/normalized/<slug>.csv olarak TEK SATIRLIK normalize veriyi yazar.
-# Her çalıştırmada raw/ ve normalized/ klasörleri temizlenir.
+# ci/collector_gdrive_ci.py  — RAW → çok satırlı NORMALIZE
+# - Drive’dan indirir: data/raw/
+# - Her Excel’i satır satır işler → data/normalized/<slug>.csv (çok satır)
+# - Her çalıştırmada raw/ ve normalized/ temizlenir
 
-import os, io, re, json, argparse, shutil, unicodedata
+import os, io, re, json, argparse, unicodedata
 import pandas as pd
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -12,23 +11,22 @@ from googleapiclient.http import MediaIoBaseDownload
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
-def log(msg): print(f"[collector] {msg}")
+def log(m): print(f"[collector] {m}")
 
-# ---------- Drive Helpers ----------
+# ---------------- Drive helpers ----------------
 def normalize_folder_id(raw):
     s = (raw or "").strip()
     m = re.search(r"/folders/([A-Za-z0-9_-]+)", s)
     return m.group(1) if m else s
 
-def drive_context(service, folder_id):
+def drive_ctx(service, folder_id):
     ctx = dict(supportsAllDrives=True, includeItemsFromAllDrives=True)
     try:
         meta = service.files().get(fileId=folder_id, fields="id,name,driveId",
                                    supportsAllDrives=True).execute()
+        ctx.update(corpora="drive" if meta.get("driveId") else "user")
         if meta.get("driveId"):
-            ctx.update(corpora="drive", driveId=meta["driveId"])
-        else:
-            ctx.update(corpora="user")
+            ctx["driveId"] = meta["driveId"]
     except Exception:
         ctx.update(corpora="allDrives")
     return ctx
@@ -38,9 +36,8 @@ def list_children(service, parent_id, ctx):
     return service.files().list(q=q, fields="files(id,name,mimeType)", **ctx).execute().get("files", [])
 
 def walk_files(service, folder_id):
-    ctx = drive_context(service, folder_id)
-    stack = [folder_id]
-    out = []
+    ctx = drive_ctx(service, folder_id)
+    stack = [folder_id]; out=[]
     while stack:
         fid = stack.pop()
         for it in list_children(service, fid, ctx):
@@ -54,14 +51,12 @@ def download_excel_like(service, file_obj, target_dir):
     os.makedirs(target_dir, exist_ok=True)
     name, mime, fid = file_obj["name"], file_obj["mimeType"], file_obj["id"]
 
-    # Google Sheets → XLSX export
     if mime == "application/vnd.google-apps.spreadsheet":
         target = os.path.join(target_dir, name if name.lower().endswith(".xlsx") else f"{name}.xlsx")
         request = service.files().export_media(
             fileId=fid,
             mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-    # Native Excel
     elif mime in (
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "application/vnd.ms-excel",
@@ -73,94 +68,94 @@ def download_excel_like(service, file_obj, target_dir):
         return None
 
     with io.FileIO(target, "wb") as fh:
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
+        dl = MediaIoBaseDownload(fh, request)
+        done=False
         while not done:
-            _, done = downloader.next_chunk()
+            _, done = dl.next_chunk()
     return target
 
-# ---------- Normalization ----------
+# ---------------- Normalization helpers ----------------
 def slugify(text):
-    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
-    text = re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip("-")
+    text = unicodedata.normalize("NFKD", str(text)).encode("ascii","ignore").decode("ascii")
+    text = re.sub(r"[^A-Za-z0-9._-]+","-", text).strip("-")
     return text or "file"
 
-def parse_num(s):
-    if s is None: return None
-    m = re.search(r"([-+]?\d+(?:\.\d+)?)", str(s))
+def parse_num(v):
+    if v is None: return None
+    m = re.search(r"([-+]?\d+(?:\.\d+)?)", str(v))
     return float(m.group(1)) if m else None
 
-def extract_metrics(df, filename):
-    """
-    Bu dosya tiplerinde veri genelde hücrelerde '24H\\n78.5%' gibi geliyor.
-    Mantık: timestamp kolonu dolu olan SON satırı al, oradaki hücre değerlerinden sayıları sök.
-    """
-    cols = [str(c) for c in df.columns]
-    # timestamp kolonunu bul (hem header hem hücrelerde tarih olabilir)
-    ts_col = None
+def pick_best_column(cols, *keys):
+    """Sütun adları içinde anahtar kelimeleri ara"""
+    keys = [k.lower() for k in keys]
     for c in cols:
-        cl = c.lower()
-        if any(k in cl for k in ["time", "date", "tarih", "zaman"]):
-            ts_col = c
-            break
-    if ts_col is None:
-        # bazen timestamp bizzat kolon adında oluyor; hiçbirini bulamazsak en sağ kolonu dene
-        ts_col = cols[-1]
+        cl = str(c).lower()
+        if any(k in cl for k in keys):
+            return c
+    return None
 
-    # timestamp'ı dolu son satır
-    series_ts = pd.to_datetime(df[ts_col], errors="coerce")
-    last_idx = series_ts.last_valid_index()
-    row = df.loc[last_idx] if last_idx is not None else df.iloc[-1]
+def detect_timestamp_col(df):
+    cols = list(df.columns)
+    # Önce isimden
+    c = pick_best_column(cols, "time","date","tarih","zaman")
+    if c: return c
+    # Olmazsa, değerleri datetime'a en fazla başarıyla çevrilen sütunu bul
+    best = None; best_count = -1
+    for c in cols:
+        s = pd.to_datetime(df[c], errors="coerce", dayfirst=True, utc=False)
+        good = s.notna().sum()
+        if good > best_count:
+            best_count = good; best = c
+    return best or cols[-1]
 
-    # oyun adı: ilk kolonun başlığı ya da hücresi
-    game = None
-    if cols:
-        game = str(cols[0]).strip()
-    if not game or game.lower().startswith("unnamed"):
-        game = str(row.iloc[0])
+def normalize_dataframe(df, source_path):
+    cols = list(df.columns)
 
-    # metrikler
-    def pick(name_candidates):
-        # önce hücrelerde ara, bulamazsan kolon adlarında ara
-        for c in df.columns:
-            if any(k in str(c).lower() for k in name_candidates):
-                val = row[c]
-                n = parse_num(val)
-                if n is not None:
-                    return n
-        for c in df.columns:
-            cl = str(c).lower()
-            if any(k in cl for k in name_candidates):
-                n = parse_num(c)
-                if n is not None:
-                    return n
-        return None
+    # Oyun adı sabiti (header ya da ilk hücre)
+    game_name = str(cols[0]).strip()
+    if not game_name or game_name.lower().startswith("unnamed"):
+        try:
+            game_name = str(df.iloc[0,0]).strip()
+        except Exception:
+            game_name = slugify(os.path.splitext(os.path.basename(source_path))[0])
 
-    m24  = pick(["24h"])
-    week = pick(["week"])
-    month= pick(["month"])
-    rtp  = pick(["rtp"])
+    # İlgili kolonları bul
+    ts_col   = detect_timestamp_col(df)
+    c_24h    = pick_best_column(cols, "24h")
+    c_week   = pick_best_column(cols, "week")
+    c_month  = pick_best_column(cols, "month")
+    c_rtp    = pick_best_column(cols, "rtp")
 
-    ts = pd.to_datetime(row[ts_col], errors="coerce")
-    if pd.isna(ts):
-        ts = pd.Timestamp.utcnow()
+    # Satır satır kayda dönüştür
+    out_rows = []
+    ts_series = pd.to_datetime(df[ts_col], errors="coerce", dayfirst=True, utc=False)
+    for i in range(len(df)):
+        ts = ts_series.iloc[i]
+        if pd.isna(ts):  # timestamp yoksa atla
+            continue
+        rec = {
+            "timestamp": ts,
+            "game": game_name,
+            "24H":  parse_num(df.iloc[i][c_24h])   if c_24h   in df.columns else None,
+            "Week": parse_num(df.iloc[i][c_week])  if c_week  in df.columns else None,
+            "Month":parse_num(df.iloc[i][c_month]) if c_month in df.columns else None,
+            "RTP":  parse_num(df.iloc[i][c_rtp])   if c_rtp   in df.columns else None,
+        }
+        # Tüm metrikler None ise satırı atla
+        if any(rec[k] is not None for k in ["24H","Week","Month","RTP"]):
+            out_rows.append(rec)
+    return pd.DataFrame(out_rows)
 
-    return {
-        "timestamp": ts.tz_localize("UTC") if ts.tzinfo is None else ts,
-        "game": str(game).strip(),
-        "24H": m24, "Week": week, "Month": month, "RTP": rtp
-    }
+def clean_dir(path):
+    if not os.path.isdir(path):
+        os.makedirs(path, exist_ok=True)
+        return
+    for f in os.listdir(path):
+        p = os.path.join(path, f)
+        if os.path.isfile(p):
+            os.remove(p)
 
-# ---------- Pipeline ----------
-def clean_dir(p):
-    if os.path.isdir(p):
-        for f in os.listdir(p):
-            fp = os.path.join(p, f)
-            if os.path.isfile(fp):
-                os.remove(fp)
-    else:
-        os.makedirs(p, exist_ok=True)
-
+# ---------------- Pipeline ----------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--folder-id", required=True, help="Drive Folder ID or full URL")
@@ -181,15 +176,14 @@ def main():
     folder_id = normalize_folder_id(args.folder_id)
     log(f"Folder: {folder_id}")
 
-    # 0) data/raw & data/normalized temizle
+    # Klasörleri temizle
     clean_dir("data/raw")
     clean_dir("data/normalized")
     log("Cleaned data/raw and data/normalized")
 
-    # 1) indir
+    # İndir
     items = walk_files(service, folder_id)
     log(f"Found {len(items)} items (including subfolders).")
-
     downloaded = []
     for it in items:
         p = download_excel_like(service, it, "data/raw")
@@ -198,29 +192,25 @@ def main():
             log(f"Downloaded: {it['name']} -> {p}")
     log(f"Excel-like files downloaded: {len(downloaded)}")
 
-    # 2) normalize & kaydet
-    rows = []
+    # Normalize (ÇOK SATIR)
     for p in downloaded:
         try:
             df = pd.read_excel(p, sheet_name=0, engine="openpyxl")
         except Exception as e:
             log(f"[SKIP read] {p}: {e}")
             continue
-        rec = extract_metrics(df, p)
-        rows.append(rec)
-        # per-file CSV
+        norm = normalize_dataframe(df, p)
+        if norm.empty:
+            log(f"[SKIP normalize] {p}: no rows parsed")
+            continue
         slug = slugify(os.path.splitext(os.path.basename(p))[0])
         out_path = os.path.join("data/normalized", f"{slug}.csv")
-        pd.DataFrame([rec]).to_csv(out_path, index=False)
-        log(f"Normalized -> {out_path}")
+        norm.to_csv(out_path, index=False)
+        log(f"Normalized rows: {len(norm)} -> {out_path}")
 
-    # 3) İsteğe bağlı: tek snapshot.csv (tüm oyunların aynı anda)
-    if rows:
-        snap = pd.DataFrame(rows)
-        snap.to_csv("data/snapshot.csv", index=False)
-        log("Wrote data/snapshot.csv with current snapshot")
-    else:
-        log("No parsed rows.")
+    # Toplu snapshot (opsiyonel): son satırı alıp birleştir
+    # (İstersen zaman serisi için ayrıca birleştirmeyiz; her oyun dosyasında tüm geçmiş var.)
+    log("Done.")
 
 if __name__ == "__main__":
     main()
