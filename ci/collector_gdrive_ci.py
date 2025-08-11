@@ -177,7 +177,6 @@ def main():
         return
 
     hist_cols = ["timestamp","game","24H","Week","Month","RTP","source_file"]
-    import pandas as pd  # re-import safe
     hist_df = pd.DataFrame(rows)[hist_cols]
     header = not os.path.exists(args.out)
     hist_df.to_csv(args.out, mode="a", header=header, index=False)
