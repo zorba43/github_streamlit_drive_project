@@ -1,7 +1,7 @@
-# ci/collector_gdrive_ci.py  — RAW → çok satırlı NORMALIZE
-# - Drive’dan indirir: data/raw/
-# - Her Excel’i satır satır işler → data/normalized/<slug>.csv (çok satır)
-# - Her çalıştırmada raw/ ve normalized/ temizlenir
+# ci/collector_gdrive_ci.py
+# Drive -> data/raw/ indirir; her Excel'i satır satır NORMALIZE edip
+# data/normalized/<slug>.csv (çok satır) yazar. Her çalıştırmada raw/ ve
+# normalized/ temizlenir. Sadece HÜCRE değerleri okunur (header'dan sayı çekilmez).
 
 import os, io, re, json, argparse, unicodedata
 import pandas as pd
@@ -24,9 +24,10 @@ def drive_ctx(service, folder_id):
     try:
         meta = service.files().get(fileId=folder_id, fields="id,name,driveId",
                                    supportsAllDrives=True).execute()
-        ctx.update(corpora="drive" if meta.get("driveId") else "user")
         if meta.get("driveId"):
-            ctx["driveId"] = meta["driveId"]
+            ctx.update(corpora="drive", driveId=meta["driveId"])
+        else:
+            ctx.update(corpora="user")
     except Exception:
         ctx.update(corpora="allDrives")
     return ctx
@@ -85,21 +86,21 @@ def parse_num(v):
     m = re.search(r"([-+]?\d+(?:\.\d+)?)", str(v))
     return float(m.group(1)) if m else None
 
-def pick_best_column(cols, *keys):
-    """Sütun adları içinde anahtar kelimeleri ara"""
-    keys = [k.lower() for k in keys]
+def match_col(cols, *keys):
+    """Kolon adlarını boşluksuz/küçük harf karşılaştır; olası varyasyonları yakala."""
+    keys = [k.replace(" ", "").lower() for k in keys]
     for c in cols:
-        cl = str(c).lower()
+        cl = str(c).lower().replace(" ", "")
         if any(k in cl for k in keys):
             return c
     return None
 
 def detect_timestamp_col(df):
     cols = list(df.columns)
-    # Önce isimden
-    c = pick_best_column(cols, "time","date","tarih","zaman")
+    # isimden dene
+    c = match_col(cols, "time","date","tarih","zaman","timestamp")
     if c: return c
-    # Olmazsa, değerleri datetime'a en fazla başarıyla çevrilen sütunu bul
+    # en çok datetime'a dönüşen sütun
     best = None; best_count = -1
     for c in cols:
         s = pd.to_datetime(df[c], errors="coerce", dayfirst=True, utc=False)
@@ -111,49 +112,53 @@ def detect_timestamp_col(df):
 def normalize_dataframe(df, source_path):
     cols = list(df.columns)
 
-    # Oyun adı sabiti (header ya da ilk hücre)
-    game_name = str(cols[0]).strip()
+    # Oyun adı
+    game_name = str(cols[0]).strip() if cols else ""
     if not game_name or game_name.lower().startswith("unnamed"):
         try:
             game_name = str(df.iloc[0,0]).strip()
         except Exception:
-            game_name = slugify(os.path.splitext(os.path.basename(source_path))[0])
+            from os.path import basename, splitext
+            game_name = splitext(basename(source_path))[0]
 
-    # İlgili kolonları bul
-    ts_col   = detect_timestamp_col(df)
-    c_24h    = pick_best_column(cols, "24h")
-    c_week   = pick_best_column(cols, "week")
-    c_month  = pick_best_column(cols, "month")
-    c_rtp    = pick_best_column(cols, "rtp")
+    # Kolon eşleştirme (SADECE hücre değerleri okunacak)
+    ts_col  = detect_timestamp_col(df)
+    c_24h   = match_col(cols, "24h", "last24h", "24hours", "24saat")
+    c_week  = match_col(cols, "week", "1w", "7d", "last7d", "7gun", "7gün")
+    c_month = match_col(cols, "month", "1m", "30d", "last30d", "30gun", "30gün")
+    c_rtp   = match_col(cols, "rtp", "returntoplayer")
 
-    # Satır satır kayda dönüştür
     out_rows = []
     ts_series = pd.to_datetime(df[ts_col], errors="coerce", dayfirst=True, utc=False)
+
     for i in range(len(df)):
         ts = ts_series.iloc[i]
-        if pd.isna(ts):  # timestamp yoksa atla
+        if pd.isna(ts):
             continue
+
+        def val(col):
+            return parse_num(df.iloc[i][col]) if (col in df.columns and col is not None) else None
+
         rec = {
             "timestamp": ts,
             "game": game_name,
-            "24H":  parse_num(df.iloc[i][c_24h])   if c_24h   in df.columns else None,
-            "Week": parse_num(df.iloc[i][c_week])  if c_week  in df.columns else None,
-            "Month":parse_num(df.iloc[i][c_month]) if c_month in df.columns else None,
-            "RTP":  parse_num(df.iloc[i][c_rtp])   if c_rtp   in df.columns else None,
+            "24H":   val(c_24h),
+            "Week":  val(c_week),
+            "Month": val(c_month),
+            "RTP":   val(c_rtp),
         }
-        # Tüm metrikler None ise satırı atla
+
         if any(rec[k] is not None for k in ["24H","Week","Month","RTP"]):
             out_rows.append(rec)
+
     return pd.DataFrame(out_rows)
 
 def clean_dir(path):
     if not os.path.isdir(path):
-        os.makedirs(path, exist_ok=True)
-        return
+        os.makedirs(path, exist_ok=True); return
     for f in os.listdir(path):
         p = os.path.join(path, f)
-        if os.path.isfile(p):
-            os.remove(p)
+        if os.path.isfile(p): os.remove(p)
 
 # ---------------- Pipeline ----------------
 def main():
@@ -192,7 +197,7 @@ def main():
             log(f"Downloaded: {it['name']} -> {p}")
     log(f"Excel-like files downloaded: {len(downloaded)}")
 
-    # Normalize (ÇOK SATIR)
+    # Normalize (çok satır, sadece hücre değerleri)
     for p in downloaded:
         try:
             df = pd.read_excel(p, sheet_name=0, engine="openpyxl")
@@ -208,8 +213,6 @@ def main():
         norm.to_csv(out_path, index=False)
         log(f"Normalized rows: {len(norm)} -> {out_path}")
 
-    # Toplu snapshot (opsiyonel): son satırı alıp birleştir
-    # (İstersen zaman serisi için ayrıca birleştirmeyiz; her oyun dosyasında tüm geçmiş var.)
     log("Done.")
 
 if __name__ == "__main__":
