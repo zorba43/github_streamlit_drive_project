@@ -26,16 +26,16 @@ jobs:
           pip install -r requirements.txt
           pip install google-api-python-client google-auth google-auth-httplib2 google-auth-oauthlib openpyxl pandas
 
-      # Write service account JSON from secret to a file (avoids JSON parsing issues)
       - name: Write service account file
         env:
           GOOGLE_APPLICATION_CREDENTIALS_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
         run: |
           python - <<'PY'
-import os, sys
+import os
 content = os.environ['GOOGLE_APPLICATION_CREDENTIALS_JSON']
-open('sa.json','w', encoding='utf-8').write(content)
-print('sa.json written')
+with open('sa.json', 'w', encoding='utf-8') as f:
+    f.write(content)
+print("sa.json written")
 PY
 
       - name: Run collector (Google Drive)
@@ -45,7 +45,6 @@ PY
         run: |
           python ci/collector_gdrive_ci.py --folder-id "$DRIVE_FOLDER_ID" --out data/history.csv
 
-      # Diagnostics + force add (bypass .gitignore)
       - name: Show CSV (diagnostic)
         run: |
           ls -lah data || true
