@@ -1,11 +1,10 @@
-# ci/collector_gdrive_ci.py  (updated: Sheets export + recursive + logs)
+# ci/collector_gdrive_ci.py
+# (Sheets export + recursive + robust ID + All Drives + better logs)
 import os, io, re, json, argparse
-from datetime import datetime
 import pandas as pd
-
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
+from googleapiclient.http import MediaIoBaseDownload
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
@@ -42,6 +41,7 @@ def extract_metrics_from_df(df, filename):
                     out["timestamp"] = ts
                     break
     else:
+        # headers may contain values
         for c in cols:
             cl = str(c).lower()
             if "24h" in cl: out["24H"] = parse_numeric(c)
@@ -70,8 +70,9 @@ def drive_context(service, folder_id):
     try:
         meta = service.files().get(fileId=folder_id, fields="id,name,driveId",
                                    supportsAllDrives=True).execute()
-        ctx.update(corpora="drive", driveId=meta.get("driveId") or None)
-        if not meta.get("driveId"):
+        if meta.get("driveId"):  # Shared Drive
+            ctx.update(corpora="drive", driveId=meta["driveId"])
+        else:                    # My Drive
             ctx.update(corpora="user")
     except Exception:
         ctx.update(corpora="allDrives")
@@ -84,51 +85,44 @@ def list_children(service, parent_id, ctx):
 def walk_files(service, folder_id):
     ctx = drive_context(service, folder_id)
     stack = [folder_id]
-    files = []
+    out = []
     while stack:
         fid = stack.pop()
-        children = list_children(service, fid, ctx)
-        for it in children:
+        for it in list_children(service, fid, ctx):
             if it["mimeType"] == "application/vnd.google-apps.folder":
                 stack.append(it["id"])
             else:
-                files.append(it)
-    return files
+                out.append(it)
+    return out
 
 def download_excel_like(service, file_obj, target_dir):
     os.makedirs(target_dir, exist_ok=True)
-    name = file_obj["name"]
-    mime = file_obj["mimeType"]
-    fid  = file_obj["id"]
+    name, mime, fid = file_obj["name"], file_obj["mimeType"], file_obj["id"]
 
-    # native Google Sheets → export as XLSX
+    # Google Sheets → export XLSX
     if mime == "application/vnd.google-apps.spreadsheet":
-        target = os.path.join(target_dir, f"{name}.xlsx") if not name.lower().endswith(".xlsx") else os.path.join(target_dir, name)
-        request = service.files().export_media(fileId=fid,
-            mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        with io.FileIO(target, "wb") as fh:
-            downloader = MediaIoBaseDownload(fh, request)
-            done = False
-            while not done:
-                _, done = downloader.next_chunk()
-        return target
-
-    # real files: xlsx/xls/xlsm
-    if mime in (
+        target = os.path.join(target_dir, name if name.lower().endswith(".xlsx") else f"{name}.xlsx")
+        request = service.files().export_media(
+            fileId=fid,
+            mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    # Real Excel files
+    elif mime in (
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "application/vnd.ms-excel",
         "application/vnd.ms-excel.sheet.macroEnabled.12",
     ):
         target = os.path.join(target_dir, name)
         request = service.files().get_media(fileId=fid)
-        with io.FileIO(target, "wb") as fh:
-            downloader = MediaIoBaseDownload(fh, request)
-            done = False
-            while not done:
-                _, done = downloader.next_chunk()
-        return target
+    else:
+        return None
 
-    return None  # other types ignored
+    with io.FileIO(target, "wb") as fh:
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+    return target
 
 def main():
     ap = argparse.ArgumentParser()
@@ -136,7 +130,7 @@ def main():
     ap.add_argument("--out", default="data/history.csv")
     args = ap.parse_args()
 
-    # Credentials
+    # Credentials (file path preferred; fallback to JSON blob)
     creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
     creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
     if creds_path and os.path.exists(creds_path):
@@ -144,21 +138,21 @@ def main():
     elif creds_json:
         creds = service_account.Credentials.from_service_account_info(json.loads(creds_json), scopes=SCOPES)
     else:
-        raise RuntimeError("Missing service account credentials.")
+        raise RuntimeError("Missing service account credentials (env).")
 
     service = build("drive", "v3", credentials=creds)
 
     folder_id = normalize_folder_id(args.folder_id)
     log(f"Folder: {folder_id}")
 
-    all_items = walk_files(service, folder_id)
-    log(f"Found {len(all_items)} items (including subfolders).")
+    items = walk_files(service, folder_id)
+    log(f"Found {len(items)} items (including subfolders).")
 
     os.makedirs("incoming", exist_ok=True)
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
     downloaded = []
-    for it in all_items:
+    for it in items:
         p = download_excel_like(service, it, "incoming")
         if p:
             downloaded.append(p)
@@ -183,6 +177,7 @@ def main():
         return
 
     hist_cols = ["timestamp","game","24H","Week","Month","RTP","source_file"]
+    import pandas as pd  # re-import safe
     hist_df = pd.DataFrame(rows)[hist_cols]
     header = not os.path.exists(args.out)
     hist_df.to_csv(args.out, mode="a", header=header, index=False)
