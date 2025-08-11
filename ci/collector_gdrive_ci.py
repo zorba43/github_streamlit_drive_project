@@ -53,4 +53,75 @@ def download_excel_like(service, file_obj, target_dir):
 
     # Google Sheets → XLSX export
     if mime == "application/vnd.google-apps.spreadsheet":
-        target = os.path.join(target_dir, name if name.lower().endswith(".xlsx") else f"{name}.xlsx"_
+        target = os.path.join(target_dir, name if name.lower().endswith(".xlsx") else f"{name}.xlsx")
+        request = service.files().export_media(
+            fileId=fid,
+            mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+    # Native Excel
+    elif mime in (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "application/vnd.ms-excel",
+        "application/vnd.ms-excel.sheet.macroEnabled.12",
+    ):
+        target = os.path.join(target_dir, name)
+        request = service.files().get_media(fileId=fid)
+    else:
+        return None
+
+    with io.FileIO(target, "wb") as fh:
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+    return target
+
+def clean_data_folder(path="data"):
+    os.makedirs(path, exist_ok=True)
+    removed = 0
+    for fname in os.listdir(path):
+        fp = os.path.join(path, fname)
+        if os.path.isfile(fp) and fname.lower().endswith((".xlsx",".xls",".xlsm")):
+            os.remove(fp)
+            removed += 1
+    return removed
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--folder-id", required=True, help="Drive Folder ID or full URL")
+    args = ap.parse_args()
+
+    # Credentials: file path preferred; fall back to JSON blob
+    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    creds_json = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+    if creds_path and os.path.exists(creds_path):
+        creds = service_account.Credentials.from_service_account_file(creds_path, scopes=SCOPES)
+    elif creds_json:
+        creds = service_account.Credentials.from_service_account_info(json.loads(creds_json), scopes=SCOPES)
+    else:
+        raise RuntimeError("Missing service account credentials.")
+
+    service = build("drive", "v3", credentials=creds)
+
+    folder_id = normalize_folder_id(args.folder_id)
+    log(f"Folder: {folder_id}")
+
+    # 1) data/ klasörünü temizle
+    removed = clean_data_folder("data")
+    log(f"Cleaned data/: removed {removed} old files")
+
+    # 2) Drive’ı gez ve indir
+    items = walk_files(service, folder_id)
+    log(f"Found {len(items)} items (including subfolders).")
+
+    downloaded = 0
+    for it in items:
+        p = download_excel_like(service, it, "data")
+        if p:
+            downloaded += 1
+            log(f"Downloaded: {it['name']} -> {p}")
+
+    log(f"Downloaded {downloaded} Excel-like files into data/")
+
+if __name__ == "__main__":
+    main()
