@@ -23,31 +23,32 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install google-api-python-client google-auth google-auth-httplib2 google-auth-oauthlib
+          pip install google-api-python-client google-auth google-auth-httplib2 google-auth-oauthlib pandas openpyxl
 
       - name: Write service account file
         run: python -c "import os; open('sa.json','w').write(os.environ['GOOGLE_APPLICATION_CREDENTIALS_JSON'])"
         env:
           GOOGLE_APPLICATION_CREDENTIALS_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
 
-      - name: Run collector (Drive → data/ mirror)
+      - name: Run collector (Drive → data/raw + data/normalized)
         env:
           DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
           GOOGLE_APPLICATION_CREDENTIALS: ${{ github.workspace }}/sa.json
         run: python ci/collector_gdrive_ci.py --folder-id "$DRIVE_FOLDER_ID"
 
-      - name: Show data folder (diagnostic)
+      - name: Show data folders (diagnostic)
         run: |
-          ls -lah data || true
+          echo "::group::data/raw"; ls -lah data/raw || true; echo "::endgroup::"
+          echo "::group::data/normalized"; ls -lah data/normalized || true; echo "::endgroup::"
+          [ -f data/snapshot.csv ] && (echo "SNAPSHOT:"; head -n 20 data/snapshot.csv) || true
 
       - name: Commit & push data folder
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # Değişiklikleri (silinenler dahil) ekle
           git add -A data
           if ! git diff --cached --quiet; then
-            git commit -m "Mirror Drive to data/ [skip ci]"
+            git commit -m "Mirror & normalize Drive to data/ [skip ci]"
             git push
           else
             echo "No changes to commit"
