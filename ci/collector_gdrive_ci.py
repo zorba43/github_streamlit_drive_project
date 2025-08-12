@@ -3,13 +3,14 @@
 
 """
 Google Drive --> data/raw  |  normalize --> data/normalized
-Robust: timestamp sütunu bulunamazsa SKIP (IndexError yok).
+Robust:
+- --folder-id (CLI) veya DRIVE_FOLDER_ID (env) ile klasör id
+- Timestamp bulunamazsa SKIP (IndexError yok)
 """
 
 import os
 import io
-import json
-import base64
+import argparse
 from pathlib import Path
 
 import pandas as pd
@@ -22,24 +23,23 @@ from google.oauth2 import service_account
 
 RAW_DIR = Path("data/raw")
 NORM_DIR = Path("data/normalized")
-INCOMING_DIR = Path("incoming")  # istersen kaldırabilirsin
+INCOMING_DIR = Path("incoming")
 RAW_DIR.mkdir(parents=True, exist_ok=True)
 NORM_DIR.mkdir(parents=True, exist_ok=True)
 INCOMING_DIR.mkdir(parents=True, exist_ok=True)
 
 EXCEL_MIMES = {
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # .xlsx
-    "application/vnd.ms-excel",                                           # eski .xls
+    "application/vnd.ms-excel",                                           # .xls
 }
 
-# -------------- Robust timestamp tespiti --------------
+# ---------------- Timestamp sütunu tespiti ----------------
 def detect_timestamp_col(df):
     """
     Timestamp kolonunu bulur; bulunamazsa None döndürür.
-    - İsimden arama: time / date / tarih (case-insensitive)
-    - İçerik tabanlı arama: ilk 10 kolonda datetime oranı >= %30 ise kabul
+    - İsim: time / date / tarih (case-insensitive)
+    - İçerik: ilk 10 kolonda datetime oranı >= %30 ise kabul
     """
-    # Boş/kolonsuz dataframe koruması
     if df is None or getattr(df, "empty", True) or df.shape[1] == 0:
         return None
 
@@ -53,7 +53,7 @@ def detect_timestamp_col(df):
     if name_candidates:
         return name_candidates[0]
 
-    # İçerikten aday (datetime oranı)
+    # İçerikten adaylar
     best_col, best_ratio = None, 0.0
     for c in df.columns[:10]:
         try:
@@ -66,41 +66,35 @@ def detect_timestamp_col(df):
 
     if best_col is None or best_ratio < 0.30:
         return None
-
     return best_col
 
 
-# -------------- Normalizasyon --------------
+# ---------------- Normalizasyon ----------------
 def normalize_dataframe(df, src_path_for_log=""):
     """
-    df: ham dataframe
+    Girdi DF'yi normalize eder.
     Dönüş: (normalized_df, reason)
       - normalized_df None ise "reason" SKIP sebebidir.
     """
-    # Boş/kolonsuz DF → SKIP
     if df is None or getattr(df, "empty", True) or df.shape[1] == 0:
         return None, "no rows"
 
-    # Timestamp kolonu tespiti
     ts_col = detect_timestamp_col(df)
     if not ts_col:
         return None, "no timestamp column"
 
-    # Timestamp normalize
     df = df.copy()
     df["timestamp"] = pd.to_datetime(df[ts_col], errors="coerce", utc=True)
     df = df.dropna(subset=["timestamp"])
     if df.empty:
         return None, "no valid timestamps"
 
-    # 0–100 aralığına zorlayalım (duvardan taşan değerleri NA yap)
     for col in ["RTP", "24H", "Week", "Month"]:
         if col in df.columns:
             df.loc[(df[col] < 0) | (df[col] > 100), col] = pd.NA
 
     df = df.sort_values("timestamp")
 
-    # En az bir metrik olmalı; sadece timestamp kalırsa SKIP
     wanted = ["timestamp", "RTP", "24H", "Week", "Month"]
     present = [c for c in wanted if c in df.columns]
     if present == ["timestamp"]:
@@ -110,27 +104,22 @@ def normalize_dataframe(df, src_path_for_log=""):
     return norm, "ok"
 
 
-# -------------- Excel okuma: daha sağlam --------------
-def read_excel_safely(path):
+# ---------------- Excel okuma (sağlam) ----------------
+def read_excel_safely(path: Path) -> pd.DataFrame:
     """
-    En çok sütun barındıran sheet'i seçerek oku (çoğu durumda data oradadır).
-    Okuma hatasında boş DF döndürür.
+    En çok sütun barındıran sheet'i seçerek oku. Okunamazsa boş DF döndür.
     """
     try:
         x = pd.ExcelFile(path, engine="openpyxl")
-        # En fazla sütun sayısına sahip sheet'i seç
-        best_sheet = None
-        max_cols = -1
+        best_sheet, max_cols = None, -1
         for s in x.sheet_names:
             try:
                 sample = pd.read_excel(x, sheet_name=s, nrows=5)
                 if sample.shape[1] > max_cols:
-                    max_cols = sample.shape[1]
-                    best_sheet = s
+                    max_cols, best_sheet = sample.shape[1], s
             except Exception:
                 continue
         if best_sheet is None:
-            # doğrudan ilk sayfayı dene
             return pd.read_excel(x, sheet_name=0)
         return pd.read_excel(x, sheet_name=best_sheet)
     except Exception as e:
@@ -138,27 +127,35 @@ def read_excel_safely(path):
         return pd.DataFrame()
 
 
-# -------------- Drive yardımcıları --------------
+# ---------------- Drive yardımcıları ----------------
 def build_drive_service():
-    # 1) GOOGLE_APPLICATION_CREDENTIALS (dosya yolu) varsa onu kullanır
+    # 1) Dosya yolu
     gac_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
     if gac_path and Path(gac_path).exists():
-        creds = service_account.Credentials.from_service_account_file(gac_path, scopes=["https://www.googleapis.com/auth/drive.readonly"])
+        creds = service_account.Credentials.from_service_account_file(
+            gac_path,
+            scopes=["https://www.googleapis.com/auth/drive.readonly"],
+        )
         return build("drive", "v3", credentials=creds)
 
-    # 2) Yoksa GCP_SA_JSON (string) varsa geçici dosya oluştur
+    # 2) JSON string
     gac_json = os.getenv("GCP_SA_JSON")
     if gac_json:
         tmp = Path("gcp_sa_temp.json")
         tmp.write_text(gac_json, encoding="utf-8")
-        creds = service_account.Credentials.from_service_account_file(str(tmp), scopes=["https://www.googleapis.com/auth/drive.readonly"])
+        creds = service_account.Credentials.from_service_account_file(
+            str(tmp),
+            scopes=["https://www.googleapis.com/auth/drive.readonly"],
+        )
         return build("drive", "v3", credentials=creds)
 
-    raise RuntimeError("Service account credentials not found. Set GOOGLE_APPLICATION_CREDENTIALS or GCP_SA_JSON.")
+    raise RuntimeError(
+        "Service account credentials not found. "
+        "Set GOOGLE_APPLICATION_CREDENTIALS or GCP_SA_JSON."
+    )
 
 
-def list_drive_files(service, folder_id):
-    # Alt klasörler dahil .xlsx/.xls getir
+def list_drive_files(service, folder_id: str):
     query = f"'{folder_id}' in parents and trashed = false"
     page_token = None
     files = []
@@ -188,18 +185,19 @@ def download_drive_file(service, file_id, out_path: Path):
     out_path.write_bytes(fh.getvalue())
 
 
-# -------------- main --------------
+# ---------------- main ----------------
 def main():
-    # Klasörleri temiz tutmak istersen:
-    # for p in RAW_DIR.glob("*.xlsx"): p.unlink(missing_ok=True)
-    # for p in NORM_DIR.glob("*.csv"):  p.unlink(missing_ok=True)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--folder-id", dest="folder_id", default=None,
+                        help="Google Drive folder id (CLI öncelikli).")
+    args = parser.parse_args()
 
-    folder_id = os.getenv("DRIVE_FOLDER_ID", "").strip()
+    # CLI > ENV
+    folder_id = (args.folder_id or os.getenv("DRIVE_FOLDER_ID", "")).strip()
     if not folder_id:
-        raise RuntimeError("DRIVE_FOLDER_ID is empty")
+        raise RuntimeError("Drive folder id is empty. Pass --folder-id or set DRIVE_FOLDER_ID.")
 
     print("[collector] Cleaning data/raw and data/normalized")
-    # İstersen tamamen temizle:
     for p in RAW_DIR.glob("*"):
         p.unlink(missing_ok=True)
     for p in NORM_DIR.glob("*"):
@@ -209,7 +207,7 @@ def main():
     files = list_drive_files(service, folder_id)
     print(f"[collector] Found {len(files)} items (including subfolders).")
 
-    # 1) İndir
+    # 1) Download
     for f in files:
         out = RAW_DIR / f["name"]
         try:
@@ -223,13 +221,11 @@ def main():
     print(f"[collector] Excel-like files downloaded: {len(excel_files)}")
 
     for p in excel_files:
-        # Okuma
         df = read_excel_safely(p)
         if df is None or df.empty:
             print(f"[collector] [SKIP normalize] {p}: no rows parsed")
             continue
 
-        # Normalize
         norm, reason = normalize_dataframe(df, str(p))
         if norm is None:
             print(f"[collector] [SKIP normalize] {p}: {reason}")
