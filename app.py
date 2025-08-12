@@ -1,4 +1,4 @@
-# app.py  (LITE)
+# app.py  (LITE – tarih filtresi yok)
 import os, io, base64, time, requests
 from pathlib import Path
 from datetime import datetime
@@ -92,7 +92,6 @@ def list_csv_api_urls(owner, repo, path, branch, headers, _ref=0):
 # ---- seçilince tek dosyayı indir ----
 @st.cache_data(ttl=60)
 def load_csv_from_api_content(url, headers, _ref=0):
-    # API content: base64 csv
     r = requests.get(url, headers=headers, timeout=20)
     r.raise_for_status()
     j = r.json()
@@ -122,7 +121,7 @@ else:
     files_map = api_map
 
 st.title("📈 Normalized Oyun Zaman Serileri (Lite)")
-st.caption(f"Veri kaynağı: **{source}** — Yalnızca seçilen oyun dosyası yüklenir.")
+st.caption(f"Veri kaynağı: **{source}** — Yalnızca seçilen oyun dosyası yüklenir. (Tarih filtresi yok, tüm veri)")
 
 # Dosya adından oyun adı üret (uzantısız, tire/altçizgi -> boşluk)
 def nice_game_name(filename):
@@ -157,18 +156,8 @@ with st.spinner("Veri indiriliyor..."):
         gdf = pd.read_csv(selected_url_or_path, parse_dates=["timestamp"])
 gdf = gdf.dropna(subset=["timestamp"]).sort_values("timestamp")
 
-# Tarih filtresi
-min_ts = gdf["timestamp"].min()
-max_ts = gdf["timestamp"].max()
-d1, d2 = st.columns(2)
-with d1:
-    start_date = st.date_input("Başlangıç", value=(min_ts.date() if pd.notna(min_ts) else datetime.utcnow().date()))
-with d2:
-    end_date = st.date_input("Bitiş", value=(max_ts.date() if pd.notna(max_ts) else datetime.utcnow().date()))
-mask = (gdf["timestamp"] >= pd.Timestamp(start_date)) & (gdf["timestamp"] <= pd.Timestamp(end_date) + pd.Timedelta(days=1))
-
-# Görselleştirilecek df
-plot_df = gdf.loc[mask, ["timestamp", metric]].copy()
+# Görselleştirilecek df (TÜM VERİ)
+plot_df = gdf.loc[:, ["timestamp", metric]].copy()
 if resample != "(yok)" and not plot_df.empty:
     plot_df = plot_df.set_index("timestamp").resample(resample).mean().reset_index()
 
@@ -209,7 +198,7 @@ else:
 # Tek metrik grafik
 st.subheader(f"🎯 {game_label} — {metric}")
 if plot_df.empty or plot_df[metric].dropna().empty:
-    st.info("Seçili filtre/metric için veri yok.")
+    st.info("Seçili metric için veri yok.")
 else:
     fig = px.line(plot_df, x="timestamp", y=metric, markers=True)
     last_ts = base_sorted["timestamp"].max()
@@ -223,12 +212,12 @@ else:
 
 # ADioG – tüm seriler + sinyal noktaları
 st.subheader(f"🧪 ADioG — {game_label} (RTP gri, 24H kırmızı, Week lacivert, Month siyah)")
-adio_df = gdf.loc[mask, ["timestamp","RTP","24H","Week","Month"]].dropna().copy()
+adio_df = gdf.loc[:, ["timestamp","RTP","24H","Week","Month"]].dropna().copy()
 if resample != "(yok)" and not adio_df.empty:
     adio_df = (adio_df.set_index("timestamp").resample(resample).mean().reset_index())
 
 if adio_df.empty:
-    st.info("ADioG için seçili tarih aralığında veri yok.")
+    st.info("ADioG için veri yok.")
 else:
     slope_series = compute_slope_series(adio_df, slope_window if use_slope else None)
     adio_df["ENTRY"] = [
@@ -263,14 +252,7 @@ else:
     )
     st.plotly_chart(fig_all, use_container_width=True)
 
-    colx, coly = st.columns(2)
-    with colx:
-        st.metric("Toplam Giriş Sinyali", int(adio_df["ENTRY"].sum()))
-    with coly:
-        last_ts_sig = sig_pts["timestamp"].iloc[-1] if not sig_pts.empty else None
-        st.metric("Son Giriş Sinyali", "-" if last_ts_sig is None else last_ts_sig.strftime("%Y-%m-%d %H:%M"))
-
 # tablo
 st.divider()
-st.subheader("🧾 Veri")
+st.subheader("🧾 Veri (seçilen metric)")
 st.dataframe(plot_df, use_container_width=True, hide_index=True)
