@@ -1,201 +1,260 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-Collector - Scraper Data klasöründeki Excel dosyalarını normalleştirir.
-- Kaynak: Google Drive (--folder-id) veya yerel yol (--local-dir "Scraper Data")
-- Girdi Excel şeması:
-    Text          -> Oyun adı (string)
-    Text1         -> "24Hxx.xx%" (xx.xx numeriği alınır)
-    Text2         -> "Weekxx.xx%"
-    Text3         -> "Monthxx.xx%"
-    Text4         -> "RTPxx.xx%"
-    Current_time  -> Timestamp
-- Çıktı: data/normalized/<dosya-adi-veya-oyun-adi>.csv
-  Kolonlar: timestamp, game, rtp, 24h, week, month
-"""
-
-import argparse
 import os
+import io
 import re
-import shutil
 import sys
+import csv
+import json
+import time
+import shutil
+import logging
 import tempfile
-from typing import Optional, List
+from pathlib import Path
+from typing import Iterable, Dict, List, Optional
 
 import pandas as pd
 
-# ---------- Yardımcılar ----------
+# Google Drive API
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
+from google.oauth2 import service_account
 
-def log(msg: str):
-    print(f"[collector] {msg}")
+# -----------------------
+# Ayarlar / Sabitler
+# -----------------------
+SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
-def ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
+RAW_DIR = Path("data/raw")
+NORM_DIR = Path("data/normalized")
 
-def slugify(name: str) -> str:
-    name = name.strip().lower()
-    name = re.sub(r"[^a-z0-9]+", "-", name)
-    return name.strip("-") or "game"
+# Excel sütun adları (sizden gelen şema)
+COL_GAME = "Text"
+COL_24H = "Text1"
+COL_WEEK = "Text2"
+COL_MONTH = "Text3"
+COL_RTP = "Text4"
+COL_TIME = "Current_time"
 
-VALUE_RE = r"([0-9]+(?:[.,][0-9]+)?)\s*%?"
+# En dayanıklı sayı yakalama (örn: '24H96.7%','Week104.12%','RTP96.07%')
+NUM_RE = re.compile(r"([-+]?\d+(?:\.\d+)?)\s*%")
 
-def parse_prefixed_number(text: Optional[str], prefix: str) -> Optional[float]:
+def setup_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[collector] %(message)s",
+        stream=sys.stdout,
+    )
+
+
+def get_service_from_env() -> "Resource":
     """
-    '24H108.03%' gibi bir metinden prefix sonrası sayıyı döndürür (ör. 108.03).
+    GitHub Secret'ına koyduğumuz JSON içeriğinden service account cred yaratır.
+    GDRIVE_CREDENTIALS: json string
     """
-    if not isinstance(text, str):
+    creds_json = os.environ.get("GDRIVE_CREDENTIALS")
+    if not creds_json:
+        logging.info("credentials.json bulunamadı, Drive indirme atlanacak.")
+        sys.exit(0)
+
+    info = json.loads(creds_json)
+    creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+    service = build("drive", "v3", credentials=creds)
+    return service
+
+
+def list_all_files_recursive(service, folder_id: str) -> List[Dict]:
+    """Verilen Google Drive klasöründeki *tüm alt klasörleri* dolaşır, dosyaları döner."""
+    results: List[Dict] = []
+
+    def walk(fid: str):
+        page_token = None
+        while True:
+            resp = (
+                service.files()
+                .list(
+                    q=f"'{fid}' in parents and trashed=false",
+                    fields="files(id,name,mimeType),nextPageToken",
+                    pageToken=page_token,
+                )
+                .execute()
+            )
+            for f in resp.get("files", []):
+                if f["mimeType"] == "application/vnd.google-apps.folder":
+                    walk(f["id"])
+                else:
+                    results.append(f)
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+
+    walk(folder_id)
+    return results
+
+
+def download_file(service, file_id: str, dst_path: Path) -> None:
+    """Drive dosyasını yerel dosyaya indirir."""
+    request = service.files().get_media(fileId=file_id)
+    fh = io.FileIO(dst_path, "wb")
+    downloader = MediaIoBaseDownload(fh, request, chunksize=1024 * 1024)
+    done = False
+    while not done:
+        status, done = downloader.next_chunk()
+    fh.close()
+
+
+def ensure_dirs() -> None:
+    RAW_DIR.mkdir(parents=True, exist_ok=True)
+    NORM_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def sanitize_game_name(name: str) -> str:
+    """
+    Oyun ismini dosya ismine uygun hale getirmek (küçük harf, boşluk -> '-').
+    """
+    s = name.strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+    return s or "game"
+
+
+def parse_pct(cell: Optional[str]) -> Optional[float]:
+    """
+    '24H96.7%' / 'Week104.12%' / 'RTP96.07%' gibi stringlerden sayıyı çeker.
+    İçinde % yoksa None döner.
+    """
+    if cell is None:
+        return None
+    if not isinstance(cell, str):
+        cell = str(cell)
+
+    m = NUM_RE.search(cell)
+    if not m:
         return None
     try:
-        m = re.search(prefix + r"\s*" + VALUE_RE, text, flags=re.IGNORECASE)
-        if not m:
-            return None
-        val = m.group(1).replace(",", ".")
-        return float(val)
+        return float(m.group(1))
     except Exception:
         return None
 
-def detect_game(df: pd.DataFrame) -> Optional[str]:
-    if "Text" in df.columns:
-        s = df["Text"].dropna().astype(str).str.strip()
-        if len(s) > 0:
-            return s.iloc[0]
-    return None
 
-def normalize_one_excel(xlsx_path: str) -> Optional[pd.DataFrame]:
+def normalize_excel(xlsx_path: Path) -> int:
     """
-    Tek Excel'i normalleştir: belirtilen kolonlardan değerleri parse eder.
-    Dönüş: normalize DF (timestamp, game, rtp, 24h, week, month) ya da None.
+    Bir Excel dosyasını okur, her satır için normalize edilmiş satırları
+    ilgili oyun CSV’sine (append) yazar.
+    Döndürdüğü sayı: yazılan satır adedi.
     """
     try:
-        df = pd.read_excel(xlsx_path, engine="openpyxl")
+        df = pd.read_excel(xlsx_path)
     except Exception as e:
-        log(f"Uyarı: '{xlsx_path}' okunamadı: {e}")
-        return None
-
-    required_cols = ["Text", "Text1", "Text2", "Text3", "Text4", "Current_time"]
-    missing = [c for c in required_cols if c not in df.columns]
-    if missing:
-        log(f"Uyarı: '{xlsx_path}' normalize edilemedi (eksik kolonlar: {missing}).")
-        return None
-
-    out = pd.DataFrame()
-    out["timestamp"] = pd.to_datetime(df["Current_time"], errors="coerce", utc=True)
-    out["game"] = df["Text"].astype(str).str.strip()
-
-    # 24H / Week / Month / RTP doğru parse
-    out["24h"] = df["Text1"].apply(lambda x: parse_prefixed_number(x, "24H"))
-    out["week"] = df["Text2"].apply(lambda x: parse_prefixed_number(x, "Week"))
-    out["month"] = df["Text3"].apply(lambda x: parse_prefixed_number(x, "Month"))
-    out["rtp"] = df["Text4"].apply(lambda x: parse_prefixed_number(x, "RTP"))
-
-    # Geçersiz timestamp'ı at
-    out = out.dropna(subset=["timestamp"]).copy()
-    if out.empty:
-        log(f"Uyarı: '{xlsx_path}' dosyasında geçerli satır yok (timestamp/kolonlar boş).")
-        return None
-
-    out = out.sort_values("timestamp").reset_index(drop=True)
-    return out
-
-# ---------- Drive (opsiyonel) ----------
-
-def fetch_drive_files(folder_id: str, dest_dir: str) -> List[str]:
-    """
-    Service account ile Google Drive klasöründen .xlsx indirir.
-    Çalışması için CREDENTIALS_JSON içerikli GOOGLE_APPLICATION_CREDENTIALS (ya da
-    iş akışında dosya yazılması) gerekir.
-    """
-    from googleapiclient.discovery import build
-    from google.oauth2 import service_account
-
-    creds_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
-    if not creds_path or not os.path.exists(creds_path):
-        log("credentials.json bulunamadı, Drive indirme atlanacak.")
-        return []
-
-    SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
-    creds = service_account.Credentials.from_service_account_file(creds_path, scopes=SCOPES)
-    service = build("drive", "v3", credentials=creds)
-
-    q = f"'{folder_id}' in parents and trashed = false and mimeType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'"
-    results = service.files().list(q=q, fields="files(id,name)").execute()
-    files = results.get("files", [])
-    paths = []
-    for f in files:
-        name = f["name"]
-        fid = f["id"]
-        out_path = os.path.join(dest_dir, name)
-        request = service.files().get_media(fileId=fid)
-        from googleapiclient.http import MediaIoBaseDownload
-        import io
-        fh = io.FileIO(out_path, "wb")
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
-        fh.close()
-        log(f"Drive'dan indirildi: {name}")
-        paths.append(out_path)
-    return paths
-
-# ---------- Ana akış ----------
-
-def collect_and_normalize(folder_id: Optional[str], local_dir: Optional[str]) -> int:
-    """
-    Drive klasörü (folder_id) veya yerel klasör (local_dir) kaynak alınır,
-    tüm .xlsx dosyaları normalize edip data/normalized altına yazılır.
-    """
-    ensure_dir("data/normalized")
-    tmpdir = tempfile.mkdtemp(prefix="scraper_")
-    src_files: List[str] = []
-
-    try:
-        if local_dir:
-            if not os.path.isdir(local_dir):
-                log(f"Hata: Yerel klasör bulunamadı: '{local_dir}'")
-                return 1
-            for fn in os.listdir(local_dir):
-                if fn.lower().endswith((".xlsx", ".xls")):
-                    src_files.append(os.path.join(local_dir, fn))
-            if not src_files:
-                log(f"Uyarı: '{local_dir}' içinde Excel bulunamadı.")
-        elif folder_id:
-            log("Drive'dan indiriliyor...")
-            src_files = fetch_drive_files(folder_id, tmpdir)
-            if not src_files:
-                log("Uyarı: Drive klasöründe indirilecek Excel bulunamadı.")
-        else:
-            log("Hata: Kaynak seçilmedi. --local-dir ya da --folder-id vermelisiniz.")
-            return 1
-
-        for path in src_files:
-            df = normalize_one_excel(path)
-            if df is None or df.empty:
-                continue
-
-            # Dosya adına göre ya da oyun adına göre çıktı adı
-            # 1) Oyun adı belirlenebiliyorsa onu kullan
-            game_name = detect_game(df) or os.path.splitext(os.path.basename(path))[0]
-            out_name = slugify(game_name) + ".csv"
-            out_path = os.path.join("data", "normalized", out_name)
-            df.to_csv(out_path, index=False)
-            log(f"Normalized yazıldı -> {out_path}")
-
-        log("Bitti.")
+        logging.info(f"{xlsx_path.name} okunamadı: {e}")
         return 0
 
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    # Gerekli kolonlar var mı?
+    for col in [COL_GAME, COL_24H, COL_WEEK, COL_MONTH, COL_RTP, COL_TIME]:
+        if col not in df.columns:
+            logging.info(f"{xlsx_path.name} normalize edilemedi (eksik kolon: {col}).")
+            return 0
+
+    # Tarih dönüşümü
+    try:
+        df["timestamp"] = pd.to_datetime(df[COL_TIME], errors="coerce")
+    except Exception:
+        df["timestamp"] = pd.NaT
+
+    # Hesaplanan alanlar
+    df["rtp"] = df[COL_RTP].apply(parse_pct)
+    df["24h"] = df[COL_24H].apply(parse_pct)
+    df["week"] = df[COL_WEEK].apply(parse_pct)
+    df["month"] = df[COL_MONTH].apply(parse_pct)
+
+    # Sadece gerekli alanlar
+    out = df[[COL_GAME, "timestamp", "rtp", "24h", "week", "month"]].dropna(
+        subset=["timestamp"]
+    )
+    out = out.rename(columns={COL_GAME: "game"})
+    out = out.sort_values("timestamp")
+
+    written = 0
+    for game, sub in out.groupby("game"):
+        fname = sanitize_game_name(str(game)) + ".csv"
+        dst = NORM_DIR / fname
+
+        # Var ise eskiyi al, timestamp'e göre dup drop
+        if dst.exists():
+            old = pd.read_csv(dst)
+            if "timestamp" in old.columns:
+                old["timestamp"] = pd.to_datetime(old["timestamp"], errors="coerce")
+            all_df = pd.concat([old, sub[["timestamp", "rtp", "24h", "week", "month"]]])
+        else:
+            all_df = sub[["timestamp", "rtp", "24h", "week", "month"]]
+
+        # de-dup ve sırala
+        all_df = (
+            all_df.drop_duplicates(subset=["timestamp"])
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
+        all_df.to_csv(dst, index=False)
+        written += len(sub)
+
+    return written
+
+
+def collect_and_normalize(folder_id: str) -> None:
+    """
+    Drive'dan Excel'leri indir, raw'a koy, normalize et.
+    """
+    ensure_dirs()
+    service = get_service_from_env()
+
+    logging.info("Drive’dan indiriliyor…")
+    files = list_all_files_recursive(service, folder_id)
+
+    # Sadece Excel’ler
+    excel_files = [
+        f for f in files
+        if f["name"].lower().endswith((".xlsx", ".xls"))
+    ]
+    if not excel_files:
+        logging.info("Klasörde Excel dosyası bulunamadı.")
+        return
+
+    # RAW klasörünü temizleyelim (tümünü baştan kuruyoruz)
+    for p in RAW_DIR.glob("*"):
+        if p.is_file():
+            p.unlink()
+
+    for f in excel_files:
+        name = f["name"]
+        file_id = f["id"]
+        dst = RAW_DIR / name
+        try:
+            download_file(service, file_id, dst)
+            logging.info(f"İndirildi: {name}")
+        except Exception as e:
+            logging.info(f"{name} indirilemedi: {e}")
+
+    # Normalize et
+    total = 0
+    for x in RAW_DIR.glob("*.xlsx"):
+        total += normalize_excel(x)
+    for x in RAW_DIR.glob("*.xls"):
+        total += normalize_excel(x)
+
+    logging.info(f"Normalize edilen satır sayısı: {total}")
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--folder-id", type=str, default=None, help="Google Drive klasör ID")
-    parser.add_argument("--local-dir", type=str, default=None, help="Yerel klasör (örn. 'Scraper Data')")
-    args = parser.parse_args()
+    setup_logging()
 
-    sys.exit(collect_and_normalize(folder_id=args.folder_id, local_dir=args.local_dir))
+    # GitHub Actions'tan gelecek
+    folder_id = os.environ.get("DRIVE_FOLDER_ID", "").strip()
+    if not folder_id:
+        logging.info("DRIVE_FOLDER_ID eksik; çıkılıyor.")
+        sys.exit(0)
+
+    collect_and_normalize(folder_id)
+    logging.info("Bitti.")
 
 
 if __name__ == "__main__":
