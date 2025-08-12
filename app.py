@@ -113,7 +113,7 @@ if not files_map:
     st.stop()
 
 st.title("📈 Normalized Oyun Zaman Serileri (Lite)")
-st.caption("Veri kaynağı: **{0}** — Yalnızca seçilen oyun dosyası yüklenir. (Tarih filtresi yok; görünüm **adım sayısı** ile)".format(source))
+st.caption("Veri kaynağı: **{0}** — Tarih filtresi yok; görünüm **adım sayısı** ile (adım ≈ 10 dk).".format(source))
 
 options = {nice_game_name(k): k for k in sorted(files_map.keys())}
 game_label = st.selectbox("Oyun", list(options.keys()))
@@ -160,7 +160,6 @@ for col in ["RTP", "24H", "Week", "Month"]:
 
 gdf = gdf.dropna(subset=["timestamp"]).sort_values("timestamp")
 
-# Eğer tamamen boşsa
 if gdf.empty:
     st.warning("Dosyada geçerli kayıt bulunamadı.")
     st.stop()
@@ -189,7 +188,7 @@ if slope_window is not None:
 
 def decide_signal_now(df_row, slope_24h=None, min_gap=0.3, use_slope=False, require_rtp=False):
     r24, r7, r30, rtp = df_row.get("24H"), df_row.get("Week"), df_row.get("Month"), df_row.get("RTP")
-    if any(pd.isna([r24, r7, r30])):
+    if any(pd.isna([r24, r7, r30])): 
         return "UNKNOWN", "Veri eksik"
     up_ok = (r24 - max(r7, r30)) >= min_gap
     if require_rtp and not pd.isna(rtp):
@@ -210,20 +209,35 @@ if signal_now == "BUY":
 else:
     st.warning(f"⏳ BEKLE — {reason_now}")
 
-# -------------------- tek metrik grafik --------------------
+# ================== GRAFİKLER — ADIM BAZLI X ==================
+
+# ---- 1) Tek metrik grafik (X = step) ----
 st.subheader(f"🎯 {game_label} — {metric}")
 if plot_df.empty or plot_df[metric].dropna().empty:
     st.info("Seçili metric için veri yok.")
 else:
-    fig = px.line(plot_df, x="timestamp", y=metric, markers=True)
-    # sinyal anı çizgisi
-    fig.add_shape(type="line", x0=last_ts, x1=last_ts, y0=0, y1=1,
+    plot_df = plot_df.reset_index(drop=True)
+    plot_df["step"] = range(1, len(plot_df) + 1)
+
+    fig = px.line(
+        plot_df,
+        x="step",
+        y=metric,
+        markers=True,
+        hover_data={"timestamp": True, "step": False}
+    )
+
+    # sinyal anı çizgisi — son step
+    last_step = plot_df["step"].iloc[-1]
+    fig.add_shape(type="line", x0=last_step, x1=last_step, y0=0, y1=1,
                   xref="x", yref="paper", line=dict(dash="dot", width=1.5))
-    fig.add_annotation(x=last_ts, y=1, xref="x", yref="paper",
+    fig.add_annotation(x=last_step, y=1, xref="x", yref="paper",
                        text="Sinyal anı", showarrow=False, yshift=10)
+
+    fig.update_layout(xaxis_title="Adım (≈10 dk)", yaxis_title=metric)
     st.plotly_chart(fig, use_container_width=True)
 
-# -------------------- ADioG — tüm seriler + sinyal noktaları --------------------
+# ---- 2) ADioG — tüm seriler ve sinyal noktaları (X = step) ----
 st.subheader(f"🧪 ADioG — {game_label} (RTP gri, 24H kırmızı, Week lacivert, Month siyah)")
 adio_df = view_df.loc[:, ["timestamp", "RTP", "24H", "Week", "Month"]].dropna().copy()
 if resample != "(yok)" and not adio_df.empty:
@@ -232,6 +246,7 @@ if resample != "(yok)" and not adio_df.empty:
 if adio_df.empty:
     st.info("ADioG için veri yok.")
 else:
+    # Sinyal belirleme (zamanla)
     slope_series = compute_slope_series(adio_df, int(slope_window) if (use_slope and slope_window is not None) else None)
     adio_df["ENTRY"] = [
         decide_signal_row(
@@ -242,33 +257,51 @@ else:
         for i in range(len(adio_df))
     ]
 
+    # Adım ekseni
+    adio_df = adio_df.reset_index(drop=True)
+    adio_df["step"] = range(1, len(adio_df) + 1)
+    hover_text = adio_df["timestamp"].dt.strftime("%Y-%m-%d %H:%M")
+
     fig_all = go.Figure()
-    fig_all.add_trace(go.Scatter(x=adio_df["timestamp"], y=adio_df["RTP"],
-                                 mode="lines", name="RTP", line=dict(color="#8c8c8c", width=1.5)))
-    fig_all.add_trace(go.Scatter(x=adio_df["timestamp"], y=adio_df["24H"],
-                                 mode="lines", name="24H", line=dict(color="#d62728", width=2)))
-    fig_all.add_trace(go.Scatter(x=adio_df["timestamp"], y=adio_df["Week"],
-                                 mode="lines", name="Week", line=dict(color="#1f77b4", width=2)))
-    fig_all.add_trace(go.Scatter(x=adio_df["timestamp"], y=adio_df["Month"],
-                                 mode="lines", name="Month", line=dict(color="#000000", width=2)))
+    fig_all.add_trace(go.Scatter(
+        x=adio_df["step"], y=adio_df["RTP"], mode="lines", name="RTP",
+        line=dict(color="#8c8c8c", width=1.5),
+        text=hover_text, hovertemplate="Zaman: %{text}<br>RTP=%{y:.2f}<extra></extra>"
+    ))
+    fig_all.add_trace(go.Scatter(
+        x=adio_df["step"], y=adio_df["24H"], mode="lines", name="24H",
+        line=dict(color="#d62728", width=2),
+        text=hover_text, hovertemplate="Zaman: %{text}<br>24H=%{y:.2f}<extra></extra>"
+    ))
+    fig_all.add_trace(go.Scatter(
+        x=adio_df["step"], y=adio_df["Week"], mode="lines", name="Week",
+        line=dict(color="#1f77b4", width=2),
+        text=hover_text, hovertemplate="Zaman: %{text}<br>Week=%{y:.2f}<extra></extra>"
+    ))
+    fig_all.add_trace(go.Scatter(
+        x=adio_df["step"], y=adio_df["Month"], mode="lines", name="Month",
+        line=dict(color="#000000", width=2),
+        text=hover_text, hovertemplate="Zaman: %{text}<br>Month=%{y:.2f}<extra></extra>"
+    ))
 
     sig_pts = adio_df.loc[adio_df["ENTRY"]]
     if not sig_pts.empty:
         fig_all.add_trace(go.Scatter(
-            x=sig_pts["timestamp"], y=sig_pts["24H"],
+            x=sig_pts["step"], y=sig_pts["24H"],
             mode="markers", name="Giriş Sinyali",
             marker=dict(color="#2ca02c", size=9, symbol="circle"),
-            hovertemplate="Giriş: %{x|%Y-%m-%d %H:%M}<br>24H=%{y:.2f}<extra></extra>"
+            text=sig_pts["timestamp"].dt.strftime("%Y-%m-%d %H:%M"),
+            hovertemplate="Giriş: %{text}<br>24H=%{y:.2f}<extra></extra>"
         ))
 
     fig_all.update_layout(
         margin=dict(l=10, r=10, t=30, b=10),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
-        xaxis_title="timestamp", yaxis_title="RTP / Yüzde"
+        xaxis_title="Adım (≈10 dk)", yaxis_title="RTP / Yüzde"
     )
     st.plotly_chart(fig_all, use_container_width=True)
 
 # -------------------- tablo --------------------
 st.divider()
 st.subheader("🧾 Veri (seçilen metric / seçilen adım penceresi)")
-st.dataframe(plot_df, use_container_width=True, hide_index=True)
+st.dataframe(plot_df[["timestamp", metric]], use_container_width=True, hide_index=True)
