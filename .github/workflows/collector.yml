@@ -1,8 +1,8 @@
 name: Collect from Google Drive (every 15 min)
 
 on:
-  #schedule:
-    #- cron: "*/15 * * * *"
+  schedule:
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 permissions:
