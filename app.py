@@ -1,4 +1,4 @@
-# app.py  (LITE – tarih filtresi yok + timestamp normalizasyonu + auto-zoom)
+# app.py  (LITE – tarih filtresi yok + güvenli son satır erişimi + boşluk kontrolü)
 import os, io, base64, time, requests
 from pathlib import Path
 
@@ -40,11 +40,10 @@ def nice_game_name(filename):
 
 def auto_zoom_last_days(fig, last_ts, days=7):
     if pd.notna(last_ts):
-        x_start = last_ts - pd.Timedelta(days=days)
-        x_end = last_ts + pd.Timedelta(hours=1)
-        fig.update_xaxes(range=[x_start, x_end])
+        fig.update_xaxes(range=[last_ts - pd.Timedelta(days=days),
+                                last_ts + pd.Timedelta(hours=1)])
 
-# -------------------- auth (yalın) --------------------
+# -------------------- basit auth --------------------
 AUTH_USER = "mirzam43"
 with st.sidebar:
     st.subheader("🔐 Giriş")
@@ -83,7 +82,6 @@ PATH   = get_secret("GH_PATH",   "data/normalized")
 TOKEN  = get_secret("GITHUB_TOKEN", None)
 HEADERS = {"Authorization": f"token {TOKEN}"} if TOKEN else {}
 
-# ---- sadece liste çek (hafif) ----
 @st.cache_data(ttl=60)
 def list_csv_api_urls(owner, repo, path, branch, headers, _ref=0):
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
@@ -96,7 +94,6 @@ def list_csv_api_urls(owner, repo, path, branch, headers, _ref=0):
             out[it["name"]] = it["url"]  # API content URL (raw değil)
     return out
 
-# ---- seçilince tek dosyayı indir ----
 @st.cache_data(ttl=60)
 def load_csv_from_api_content(url, headers, _ref=0):
     r = requests.get(url, headers=headers, timeout=20)
@@ -105,7 +102,6 @@ def load_csv_from_api_content(url, headers, _ref=0):
     content = base64.b64decode(j["content"])
     return pd.read_csv(io.BytesIO(content), parse_dates=["timestamp"])
 
-# ---- fallback local ----
 def list_local_csvs(local_dir="data/normalized"):
     out = {}
     p = Path(local_dir)
@@ -114,7 +110,7 @@ def list_local_csvs(local_dir="data/normalized"):
             out[f.name] = str(f)
     return out
 
-# -------------------- listeleme (yalnızca isim) --------------------
+# -------------------- listeleme --------------------
 api_map = list_csv_api_urls(OWNER, REPO, PATH, BRANCH, HEADERS, refresh_token)
 source = "GitHub" if api_map else "Local"
 files_map = api_map if api_map else list_local_csvs()
@@ -130,14 +126,12 @@ game_label = st.selectbox("Oyun", list(options.keys()))
 selected_file = options[game_label]
 selected_url_or_path = files_map[selected_file]
 
-# Metrik ve resampling
+# Ayarlar
 c1, c2 = st.columns([2, 2])
 with c1:
     metric = st.selectbox("Metrik", ["24H", "Week", "Month", "RTP"], index=0)
 with c2:
     resample = st.selectbox("Zaman aralığı (yeniden örnekleme)", ["(yok)", "15T", "30T", "1H", "4H", "1D"], index=0)
-
-# Sinyal ayarları
 with st.sidebar:
     st.markdown("### 🎛️ Sinyal Ayarları")
     min_gap = st.number_input("Minimum fark (puan)", 0.0, 5.0, 0.20, 0.05)
@@ -145,41 +139,44 @@ with st.sidebar:
     use_slope = st.checkbox("Eğim şartı (24H artıyor olsun)", value=False)
     require_rtp = st.checkbox("24H > RTP şartı", value=False)
 
-# -------------------- TEK CSV İNDİR/OKU --------------------
+# -------------------- tek CSV indir/oku --------------------
 with st.spinner("Veri indiriliyor..."):
     if source == "GitHub":
         gdf = load_csv_from_api_content(selected_url_or_path, HEADERS, refresh_token)
     else:
         gdf = pd.read_csv(selected_url_or_path, parse_dates=["timestamp"])
 
-# ---- OKUMA SONRASI NORMALİZASYON ----
+# ---- NORMALİZASYON ----
 gdf = gdf.dropna(subset=["timestamp"]).copy()
-
-# Timestamp'leri UTC-aware parse et, naive UTC'ye çevir
 gdf["timestamp"] = pd.to_datetime(gdf["timestamp"], utc=True, errors="coerce") \
                       .dt.tz_convert("UTC").dt.tz_localize(None)
 
-# Yüzdeleri 0-100 aralığında tut
 for col in ["RTP", "24H", "Week", "Month"]:
     if col in gdf.columns:
         gdf.loc[(gdf[col] < 0) | (gdf[col] > 100), col] = pd.NA
 
 gdf = gdf.dropna(subset=["timestamp"]).sort_values("timestamp")
 
-# Çok uzak tarihleri at (son 60 gün içinde olanları tut)
+# Son 60 gün penceresi
 now_utc = pd.Timestamp.utcnow().tz_localize(None)
 gdf = gdf[(gdf["timestamp"] >= now_utc - pd.Timedelta(days=60)) &
           (gdf["timestamp"] <= now_utc + pd.Timedelta(days=1))]
 
-# -------------------- Görselleştirme için df --------------------
+# <<< YENİ: Boşluk kontrolü
+if gdf.empty:
+    st.warning("Bu oyunun dosyasında son 60 gün içinde geçerli kayıt bulunamadı. "
+               "Yeni veri geldikten sonra otomatik güncellenir.")
+    st.stop()
+
+# -------------------- görselleştirme için df --------------------
 plot_df = gdf.loc[:, ["timestamp", metric]].copy()
 if resample != "(yok)" and not plot_df.empty:
     plot_df = plot_df.set_index("timestamp").resample(resample).mean().reset_index()
 
-# -------------------- Anlık sinyal --------------------
+# -------------------- anlık sinyal --------------------
 base_sorted = gdf.sort_values("timestamp")
-last_row = base_sorted.tail(1).iloc[0]
-last_ts = base_sorted["timestamp"].max()
+last_row = base_sorted.iloc[-1]         # güvenli
+last_ts  = base_sorted["timestamp"].iloc[-1]
 
 slope_window = None if slope_window_opt == "Yok" else int(slope_window_opt)
 slope_24h_now = None
@@ -213,24 +210,22 @@ if signal_now == "BUY":
 else:
     st.warning(f"⏳ BEKLE — {reason_now}")
 
-# -------------------- Tek metrik grafik --------------------
+# -------------------- tek metrik grafik --------------------
 st.subheader(f"🎯 {game_label} — {metric}")
 if plot_df.empty or plot_df[metric].dropna().empty:
     st.info("Seçili metric için veri yok.")
 else:
     fig = px.line(plot_df, x="timestamp", y=metric, markers=True)
-    # Sinyal anı çizgisi (son veri zamanı)
-    if pd.notna(last_ts):
-        x_val = last_ts.to_pydatetime() if isinstance(last_ts, pd.Timestamp) else last_ts
-        fig.add_shape(type="line", x0=x_val, x1=x_val, y0=0, y1=1,
-                      xref="x", yref="paper", line=dict(dash="dot", width=1.5))
-        fig.add_annotation(x=x_val, y=1, xref="x", yref="paper",
-                           text="Sinyal anı", showarrow=False, yshift=10)
-        # Auto-zoom: son 7 gün
-        auto_zoom_last_days(fig, last_ts, days=7)
+    # sinyal anı çizgisi
+    fig.add_shape(type="line", x0=last_ts, x1=last_ts, y0=0, y1=1,
+                  xref="x", yref="paper", line=dict(dash="dot", width=1.5))
+    fig.add_annotation(x=last_ts, y=1, xref="x", yref="paper",
+                       text="Sinyal anı", showarrow=False, yshift=10)
+    # auto-zoom son 7 gün
+    auto_zoom_last_days(fig, last_ts, days=7)
     st.plotly_chart(fig, use_container_width=True)
 
-# -------------------- ADioG – tüm seriler + sinyal noktaları --------------------
+# -------------------- ADioG — tüm seriler + sinyal noktaları --------------------
 st.subheader(f"🧪 ADioG — {game_label} (RTP gri, 24H kırmızı, Week lacivert, Month siyah)")
 adio_df = gdf.loc[:, ["timestamp", "RTP", "24H", "Week", "Month"]].dropna().copy()
 if resample != "(yok)" and not adio_df.empty:
@@ -270,9 +265,7 @@ else:
             hovertemplate="Giriş: %{x|%Y-%m-%d %H:%M}<br>24H=%{y:.2f}<extra></extra>"
         ))
 
-    # Auto-zoom: son 7 gün
     auto_zoom_last_days(fig_all, last_ts, days=7)
-
     fig_all.update_layout(
         margin=dict(l=10, r=10, t=30, b=10),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
