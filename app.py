@@ -1,5 +1,5 @@
-# app.py
-import os, io, glob, base64, time, requests
+# app.py  (LITE)
+import os, io, base64, time, requests
 from pathlib import Path
 from datetime import datetime
 
@@ -8,9 +8,9 @@ import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="Normalized Time-Series Dashboard", layout="wide")
+st.set_page_config(page_title="Normalized Time-Series (Lite)", layout="wide")
 
-# -------------------- helpers --------------------
+# -------------------- utils --------------------
 def get_secret(key, default=None):
     try:
         return st.secrets[key]
@@ -18,33 +18,24 @@ def get_secret(key, default=None):
         return os.environ.get(key, default)
 
 def compute_slope_series(df, window_points):
-    """Basit eğim: (24H_now - 24H_prev)/dakika (prev = window_points-1 önceki ölçüm)."""
     if window_points is None or window_points <= 1 or "24H" not in df.columns:
         return pd.Series([None]*len(df), index=df.index)
     prev = df["24H"].shift(window_points-1)
     dtm  = (df["timestamp"] - df["timestamp"].shift(window_points-1)).dt.total_seconds()/60.0
-    slope = (df["24H"] - prev) / dtm
-    return slope
+    return (df["24H"] - prev) / dtm
 
 def decide_signal_row(row, slope_val, min_gap, use_slope=False, require_rtp=False):
-    """
-    Tek satır için GİR sinyali:
-      - 24H - max(Week, Month) >= min_gap
-      - (isteğe bağlı) 24H > RTP
-      - (isteğe bağlı) slope > 0
-    """
     r24 = row.get("24H"); r7 = row.get("Week"); r30 = row.get("Month"); rtp = row.get("RTP")
     if any(pd.isna([r24, r7, r30])): 
         return False
     up_ok = (r24 - max(r7, r30)) >= min_gap
     if require_rtp and not pd.isna(rtp):
         up_ok = up_ok and (r24 > rtp)
-    slope_ok = True
     if use_slope:
-        slope_ok = (slope_val is not None and slope_val > 0)
-    return bool(up_ok and slope_ok)
+        return bool(up_ok and (slope_val is not None and slope_val > 0))
+    return bool(up_ok)
 
-# -------------------- basit login --------------------
+# -------------------- auth (yalın) --------------------
 AUTH_USER = "mirzam43"
 with st.sidebar:
     st.subheader("🔐 Giriş")
@@ -64,18 +55,18 @@ with st.sidebar:
 if not st.session_state.get("auth", False):
     st.stop()
 
-# -------------------- auto-refresh + manuel yenile (cache-buster) --------------------
-st.components.v1.html("<meta http-equiv='refresh' content='120'>", height=0)
+# -------------------- refresh / cache-buster --------------------
+st.components.v1.html("<meta http-equiv='refresh' content='180'>", height=0)
 with st.sidebar:
     if "refresh_token" not in st.session_state:
         st.session_state["refresh_token"] = 0
     if st.button("🔄 Veriyi yenile"):
-        st.session_state["refresh_token"] += 1  # cache anahtarı değişsin
+        st.session_state["refresh_token"] += 1
         st.cache_data.clear()
         st.rerun()
 refresh_token = st.session_state.get("refresh_token", 0)
 
-# -------------------- GitHub'tan veri okuma --------------------
+# -------------------- github config --------------------
 OWNER  = get_secret("GH_OWNER",  "zorba43")
 REPO   = get_secret("GH_REPO",   "github_streamlit_drive_project")
 BRANCH = get_secret("GH_BRANCH", "main")
@@ -83,87 +74,74 @@ PATH   = get_secret("GH_PATH",   "data/normalized")
 TOKEN  = get_secret("GITHUB_TOKEN", None)
 HEADERS = {"Authorization": f"token {TOKEN}"} if TOKEN else {}
 
+# ---- sadece LİSTE çek (hafif) ----
 @st.cache_data(ttl=60)
-def list_csv_urls(owner, repo, path, branch, headers, _refresh_token=0):
-    """
-    İçerik listesi – her zaman API content URL'sini döndür (raw CDN'ini atlatır).
-    """
+def list_csv_api_urls(owner, repo, path, branch, headers, _ref=0):
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
     r = requests.get(url, headers=headers, timeout=20)
     if r.status_code != 200:
         return {}
-    items = r.json()
+    data = r.json()
     out = {}
-    for it in items:
+    for it in data:
         if it.get("type") == "file" and it["name"].lower().endswith(".csv"):
-            # => API content URL
-            out[it["name"]] = it.get("url")
+            # sadece API content URL'ü (raw değil)
+            out[it["name"]] = it["url"]
     return out
 
+# ---- seçilince tek dosyayı indir ----
 @st.cache_data(ttl=60)
-def load_csv_from_github(url, headers, _refresh_token=0):
-    """
-    API content URL ise base64 içerik; raw olursa cache-buster query ile çek.
-    """
-    if url and url.startswith("https://api.github.com/"):
-        r = requests.get(url, headers=headers, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        content = base64.b64decode(data["content"])
-        return pd.read_csv(io.BytesIO(content), parse_dates=["timestamp"])
-
-    # Fallback: raw link (CDN cache buster)
-    sep = "&" if url and "?" in url else "?"
-    url_cb = f"{url}{sep}_cb={int(time.time())}"
-    hdrs = dict(headers) if headers else {}
-    hdrs.update({"Cache-Control": "no-cache"})
-    r = requests.get(url_cb, headers=hdrs, timeout=20)
+def load_csv_from_api_content(url, headers, _ref=0):
+    # API content: base64 csv
+    r = requests.get(url, headers=headers, timeout=20)
     r.raise_for_status()
-    return pd.read_csv(io.BytesIO(r.content), parse_dates=["timestamp"])
+    j = r.json()
+    content = base64.b64decode(j["content"])
+    return pd.read_csv(io.BytesIO(content), parse_dates=["timestamp"])
 
-csv_urls = list_csv_urls(OWNER, REPO, PATH, BRANCH, HEADERS, refresh_token)
-catalog, data_source = {}, ""
+# ---- fallback local (boş repo vs) ----
+def list_local_csvs(local_dir="data/normalized"):
+    out = {}
+    p = Path(local_dir)
+    if not p.exists():
+        return out
+    for f in p.glob("*.csv"):
+        out[f.name] = str(f)
+    return out
 
-if csv_urls:
-    for fname, url in sorted(csv_urls.items()):
-        try:
-            df_tmp = load_csv_from_github(url, HEADERS, refresh_token)
-            game_name = str(df_tmp.iloc[0]["game"]) if "game" in df_tmp.columns and not df_tmp.empty else fname.rsplit(".",1)[0]
-            catalog[game_name] = ("github", url)
-        except Exception as e:
-            st.error(f"{fname} (GitHub) okunamadı: {e}")
-    data_source = "GitHub"
+# -------------------- listeleme (yalnızca isim) --------------------
+api_map = list_csv_api_urls(OWNER, REPO, PATH, BRANCH, HEADERS, refresh_token)
+source = "GitHub" if api_map else "Local"
+if not api_map:
+    local_map = list_local_csvs()
+    if not local_map:
+        st.error("CSV bulunamadı.")
+        st.stop()
+    files_map = local_map
 else:
-    LOCAL_DIR = "data/normalized"
-    files = sorted(glob.glob(str(Path(LOCAL_DIR) / "*.csv")))
-    for f in files:
-        try:
-            df_tmp = pd.read_csv(f, parse_dates=["timestamp"])
-            game_name = str(df_tmp.iloc[0]["game"]) if "game" in df_tmp.columns and not df_tmp.empty else Path(f).stem
-            catalog[game_name] = ("local", f)
-        except Exception as e:
-            st.error(f"{os.path.basename(f)} (local) okunamadı: {e}")
-    data_source = "Local"
+    files_map = api_map
 
-if not catalog:
-    st.warning("CSV bulunamadı (GitHub/Local).")
-    st.stop()
+st.title("📈 Normalized Oyun Zaman Serileri (Lite)")
+st.caption(f"Veri kaynağı: **{source}** — Yalnızca seçilen oyun dosyası yüklenir.")
 
-st.caption(f"Veri kaynağı: **{data_source}**")
+# Dosya adından oyun adı üret (uzantısız, tire/altçizgi -> boşluk)
+def nice_game_name(filename):
+    name = Path(filename).stem
+    return name.replace("-", " ").replace("_", " ").title()
 
-# -------------------- UI --------------------
-st.title("📈 Normalized Oyun Zaman Serileri")
+options = {nice_game_name(k): k for k in sorted(files_map.keys())}
+game_label = st.selectbox("Oyun", list(options.keys()))
+selected_file = options[game_label]
+selected_url_or_path = files_map[selected_file]
 
-games = sorted(catalog.keys())
-colA, colB, colC = st.columns([2,2,2])
-with colA:
-    game = st.selectbox("Oyun", games)
-with colB:
+# Metrik ve resampling
+c1, c2 = st.columns([2,2])
+with c1:
     metric = st.selectbox("Metrik", ["24H", "Week", "Month", "RTP"], index=0)
-with colC:
+with c2:
     resample = st.selectbox("Zaman aralığı (yeniden örnekleme)", ["(yok)", "15T", "30T", "1H", "4H", "1D"], index=0)
 
-# 🔧 Sinyal ayarları (default gevşek)
+# Sinyal ayarları
 with st.sidebar:
     st.markdown("### 🎛️ Sinyal Ayarları")
     min_gap = st.number_input("Minimum fark (puan)", 0.0, 5.0, 0.20, 0.05)
@@ -171,46 +149,40 @@ with st.sidebar:
     use_slope = st.checkbox("Eğim şartı (24H artıyor olsun)", value=False)
     require_rtp = st.checkbox("24H > RTP şartı", value=False)
 
-# -------------------- Veri yükle --------------------
-src, ref = catalog[game]
-try:
-    if src == "github":
-        gdf = load_csv_from_github(ref, HEADERS, refresh_token)
+# -------------------- TEK CSV İNDİR/OKU --------------------
+with st.spinner("Veri indiriliyor..."):
+    if source == "GitHub":
+        gdf = load_csv_from_api_content(selected_url_or_path, HEADERS, refresh_token)
     else:
-        gdf = pd.read_csv(ref, parse_dates=["timestamp"])
-except Exception as e:
-    st.error(f"Dosya okunamadı: {e}")
-    st.stop()
-
+        gdf = pd.read_csv(selected_url_or_path, parse_dates=["timestamp"])
 gdf = gdf.dropna(subset=["timestamp"]).sort_values("timestamp")
 
-# -------------------- Tarih filtresi --------------------
+# Tarih filtresi
 min_ts = gdf["timestamp"].min()
 max_ts = gdf["timestamp"].max()
-c1, c2 = st.columns(2)
-with c1:
+d1, d2 = st.columns(2)
+with d1:
     start_date = st.date_input("Başlangıç", value=(min_ts.date() if pd.notna(min_ts) else datetime.utcnow().date()))
-with c2:
+with d2:
     end_date = st.date_input("Bitiş", value=(max_ts.date() if pd.notna(max_ts) else datetime.utcnow().date()))
-
 mask = (gdf["timestamp"] >= pd.Timestamp(start_date)) & (gdf["timestamp"] <= pd.Timestamp(end_date) + pd.Timedelta(days=1))
+
+# Görselleştirilecek df
 plot_df = gdf.loc[mask, ["timestamp", metric]].copy()
 if resample != "(yok)" and not plot_df.empty:
     plot_df = plot_df.set_index("timestamp").resample(resample).mean().reset_index()
 
-# -------------------- Anlık sinyal --------------------
+# Anlık sinyal
 base_sorted = gdf.sort_values("timestamp")
 last_row = base_sorted.tail(1).iloc[0]
-
-# anlık slope (opsiyonel)
 slope_window = None if slope_window_opt == "Yok" else int(slope_window_opt)
 slope_24h_now = None
 if slope_window is not None:
     tmp = base_sorted[["timestamp","24H"]].dropna().tail(slope_window)
     if len(tmp) >= 2:
-        dt_min = (tmp["timestamp"].iloc[-1] - tmp["timestamp"].iloc[0]).total_seconds()/60.0
-        if dt_min > 0:
-            slope_24h_now = (tmp["24H"].iloc[-1] - tmp["24H"].iloc[0]) / dt_min
+        dt = (tmp["timestamp"].iloc[-1] - tmp["timestamp"].iloc[0]).total_seconds()/60.0
+        if dt > 0:
+            slope_24h_now = (tmp["24H"].iloc[-1] - tmp["24H"].iloc[0]) / dt
 
 def decide_signal_now(df_row, slope_24h=None, min_gap=0.3, use_slope=False, require_rtp=False):
     r24, r7, r30, rtp = df_row.get("24H"), df_row.get("Week"), df_row.get("Month"), df_row.get("RTP")
@@ -219,8 +191,9 @@ def decide_signal_now(df_row, slope_24h=None, min_gap=0.3, use_slope=False, requ
     if require_rtp and not pd.isna(rtp):
         up_ok = up_ok and (r24 > rtp)
     slope_ok = True if not use_slope else (slope_24h is not None and slope_24h > 0)
-    if up_ok and slope_ok:  return "BUY", f"24H {r24:.2f} > max(Week,Month) + {min_gap}"
-    return "HOLD", f"Koşullar sağlanmadı"
+    if up_ok and slope_ok:
+        return "BUY", f"24H {r24:.2f} > max(Week,Month) + {min_gap}"
+    return "HOLD", "Koşullar sağlanmadı"
 
 signal_now, reason_now = decide_signal_now(
     last_row, slope_24h=slope_24h_now, min_gap=min_gap,
@@ -233,8 +206,8 @@ if signal_now == "BUY":
 else:
     st.warning(f"⏳ BEKLE — {reason_now}")
 
-# -------------------- Tek metrik grafik --------------------
-st.subheader(f"🎯 {game} — {metric}")
+# Tek metrik grafik
+st.subheader(f"🎯 {game_label} — {metric}")
 if plot_df.empty or plot_df[metric].dropna().empty:
     st.info("Seçili filtre/metric için veri yok.")
 else:
@@ -248,26 +221,21 @@ else:
                            text="Sinyal anı", showarrow=False, yshift=10)
     st.plotly_chart(fig, use_container_width=True)
 
-# -------------------- ADioG: Tüm metrikler + geçmiş sinyaller --------------------
-st.subheader(f"🧪 ADioG — {game} (RTP gri, 24H kırmızı, Week lacivert, Month siyah)")
-
+# ADioG – tüm seriler + sinyal noktaları
+st.subheader(f"🧪 ADioG — {game_label} (RTP gri, 24H kırmızı, Week lacivert, Month siyah)")
 adio_df = gdf.loc[mask, ["timestamp","RTP","24H","Week","Month"]].dropna().copy()
 if resample != "(yok)" and not adio_df.empty:
-    adio_df = (adio_df.set_index("timestamp")
-                      .resample(resample)
-                      .mean()
-                      .reset_index())
+    adio_df = (adio_df.set_index("timestamp").resample(resample).mean().reset_index())
 
 if adio_df.empty:
     st.info("ADioG için seçili tarih aralığında veri yok.")
 else:
     slope_series = compute_slope_series(adio_df, slope_window if use_slope else None)
-    entries = []
-    for i, row in adio_df.iterrows():
-        slope_val = None if pd.isna(slope_series.iloc[i]) else slope_series.iloc[i]
-        entries.append(decide_signal_row(row, slope_val, min_gap,
-                                         use_slope=use_slope, require_rtp=require_rtp))
-    adio_df["ENTRY"] = entries
+    adio_df["ENTRY"] = [
+        decide_signal_row(adio_df.iloc[i], None if pd.isna(slope_series.iloc[i]) else slope_series.iloc[i],
+                          min_gap, use_slope=use_slope, require_rtp=require_rtp)
+        for i in range(len(adio_df))
+    ]
 
     fig_all = go.Figure()
     fig_all.add_trace(go.Scatter(x=adio_df["timestamp"], y=adio_df["RTP"],
@@ -295,14 +263,14 @@ else:
     )
     st.plotly_chart(fig_all, use_container_width=True)
 
-    total_signals = int(adio_df["ENTRY"].sum())
-    last_signal_ts = sig_pts["timestamp"].iloc[-1] if total_signals > 0 else None
-    cA, cB = st.columns(2)
-    with cA:
-        st.metric("Toplam Giriş Sinyali", total_signals)
-    with cB:
-        st.metric("Son Giriş Sinyali", "-" if last_signal_ts is None else last_signal_ts.strftime("%Y-%m-%d %H:%M"))
+    colx, coly = st.columns(2)
+    with colx:
+        st.metric("Toplam Giriş Sinyali", int(adio_df["ENTRY"].sum()))
+    with coly:
+        last_ts_sig = sig_pts["timestamp"].iloc[-1] if not sig_pts.empty else None
+        st.metric("Son Giriş Sinyali", "-" if last_ts_sig is None else last_ts_sig.strftime("%Y-%m-%d %H:%M"))
 
+# tablo
 st.divider()
 st.subheader("🧾 Veri")
 st.dataframe(plot_df, use_container_width=True, hide_index=True)
