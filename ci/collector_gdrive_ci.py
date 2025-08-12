@@ -3,21 +3,25 @@
 
 """
 Google Drive --> data/raw  |  normalize --> data/normalized
-Robust:
-- --folder-id (CLI) veya DRIVE_FOLDER_ID (env) ile klasör id
+
+Sağlamlaştırmalar:
+- --folder-id (CLI) veya ENV (DRIVE_FOLDER_ID / GDRIVE_FOLDER_ID / GOOGLE_DRIVE_FOLDER_ID / FOLDER_ID / INPUT_FOLDER_ID / DRIVE_FOLDER_URL)
+- Eğer URL verilirse (drive.google.com) klasör ID'sini otomatik çıkarır
 - Timestamp bulunamazsa SKIP (IndexError yok)
+- 404 durumunda anlaşılır uyarı
 """
 
 import os
 import io
+import re
 import argparse
 from pathlib import Path
 
 import pandas as pd
 
-# ---- Google Drive API ----
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.errors import HttpError
 from google.oauth2 import service_account
 
 
@@ -33,7 +37,52 @@ EXCEL_MIMES = {
     "application/vnd.ms-excel",                                           # .xls
 }
 
-# ---------------- Timestamp sütunu tespiti ----------------
+
+# -------------- Yardımcı: URL'den ID çıkar --------------
+def extract_folder_id_from_url(text: str) -> str | None:
+    if not text:
+        return None
+    # /folders/{id}
+    m = re.search(r"/folders/([a-zA-Z0-9_-]+)", text)
+    if m:
+        return m.group(1)
+    # ?id={id}
+    m = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", text)
+    if m:
+        return m.group(1)
+    return None
+
+
+def resolve_folder_id(cli_value: str | None) -> str:
+    """
+    Öncelik: CLI -> muhtemel env değişkenleri.
+    URL verilirse ID'yi otomatik ayıklar.
+    """
+    candidates = [
+        cli_value,
+        os.getenv("DRIVE_FOLDER_ID"),
+        os.getenv("GDRIVE_FOLDER_ID"),
+        os.getenv("GOOGLE_DRIVE_FOLDER_ID"),
+        os.getenv("FOLDER_ID"),
+        os.getenv("INPUT_FOLDER_ID"),
+        os.getenv("DRIVE_FOLDER_URL"),
+    ]
+    for val in candidates:
+        if not val:
+            continue
+        v = val.strip().strip('"').strip("'")
+        if not v:
+            continue
+        if "drive.google.com" in v:
+            fid = extract_folder_id_from_url(v)
+            if fid:
+                return fid
+        else:
+            return v
+    return ""
+
+
+# -------------- Timestamp sütunu tespiti --------------
 def detect_timestamp_col(df):
     """
     Timestamp kolonunu bulur; bulunamazsa None döndürür.
@@ -69,7 +118,7 @@ def detect_timestamp_col(df):
     return best_col
 
 
-# ---------------- Normalizasyon ----------------
+# -------------- Normalizasyon --------------
 def normalize_dataframe(df, src_path_for_log=""):
     """
     Girdi DF'yi normalize eder.
@@ -104,7 +153,7 @@ def normalize_dataframe(df, src_path_for_log=""):
     return norm, "ok"
 
 
-# ---------------- Excel okuma (sağlam) ----------------
+# -------------- Excel okuma (sağlam) --------------
 def read_excel_safely(path: Path) -> pd.DataFrame:
     """
     En çok sütun barındıran sheet'i seçerek oku. Okunamazsa boş DF döndür.
@@ -127,7 +176,7 @@ def read_excel_safely(path: Path) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-# ---------------- Drive yardımcıları ----------------
+# -------------- Drive yardımcıları --------------
 def build_drive_service():
     # 1) Dosya yolu
     gac_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
@@ -185,17 +234,23 @@ def download_drive_file(service, file_id, out_path: Path):
     out_path.write_bytes(fh.getvalue())
 
 
-# ---------------- main ----------------
+# -------------- main --------------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--folder-id", dest="folder_id", default=None,
-                        help="Google Drive folder id (CLI öncelikli).")
+                        help="Google Drive folder id (CLI öncelikli). URL verirseniz ID otomatik çıkarılır.")
     args = parser.parse_args()
 
-    # CLI > ENV
-    folder_id = (args.folder_id or os.getenv("DRIVE_FOLDER_ID", "")).strip()
+    # CLI/ENV/URL'den ID çöz
+    folder_id = resolve_folder_id(args.folder_id)
     if not folder_id:
-        raise RuntimeError("Drive folder id is empty. Pass --folder-id or set DRIVE_FOLDER_ID.")
+        raise RuntimeError(
+            "Drive folder id bulunamadı. "
+            "CLI ile --folder-id veya env ile DRIVE_FOLDER_ID / GDRIVE_FOLDER_ID / GOOGLE_DRIVE_FOLDER_ID / FOLDER_ID / INPUT_FOLDER_ID / DRIVE_FOLDER_URL ayarlayın."
+        )
+
+    masked = f"{folder_id[:4]}...{folder_id[-4:]}" if len(folder_id) > 8 else folder_id
+    print(f"[collector] Using Drive folder id: {masked}")
 
     print("[collector] Cleaning data/raw and data/normalized")
     for p in RAW_DIR.glob("*"):
@@ -204,10 +259,22 @@ def main():
         p.unlink(missing_ok=True)
 
     service = build_drive_service()
-    files = list_drive_files(service, folder_id)
+
+    try:
+        files = list_drive_files(service, folder_id)
+    except HttpError as e:
+        # Daha anlaşılır yönlendirme
+        print(f"[collector] Drive API error: {e}")
+        print("[collector] Olası nedenler:")
+        print("  • Klasör ID yanlış (özellikle linkten ID kopyalarken).")
+        print("  • Bu klasör, servis hesabı e-postasıyla paylaşılı değil.")
+        print("    Servis hesabı e-postası: JSON içindeki client_email alanı.")
+        print("  • Drive API yetkisi eksik.")
+        raise
+
     print(f"[collector] Found {len(files)} items (including subfolders).")
 
-    # 1) Download
+    # 1) İndir
     for f in files:
         out = RAW_DIR / f["name"]
         try:
