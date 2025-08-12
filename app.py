@@ -6,6 +6,7 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+import plotly.graph_objects as go
 
 st.set_page_config(page_title="Normalized Time-Series Dashboard", layout="wide")
 
@@ -16,32 +17,23 @@ def get_secret(key, default=None):
     except Exception:
         return os.environ.get(key, default)
 
-def decide_signal(df_row, slope_24h=None, min_gap=0.3):
-    """24H vs Week/Month + opsiyonel eğim ile sinyal üret."""
-    r24, r7, r30 = df_row.get("24H"), df_row.get("Week"), df_row.get("Month")
-    if any(pd.isna([r24, r7, r30])):
-        return "UNKNOWN", "Veri eksik"
-    up_ok   = (r24 - max(r7, r30)) >= min_gap
-    down_ok = (min(r7, r30) - r24) >= min_gap
-    if up_ok and (slope_24h is None or slope_24h > 0):
-        return "BUY", f"24H ({r24:.2f}) > Week ({r7:.2f}) & Month ({r30:.2f})"
-    if down_ok and (slope_24h is None or slope_24h <= 0):
-        return "SELL", f"24H ({r24:.2f}) < Week ({r7:.2f}) & Month ({r30:.2f})"
-    return "HOLD", f"24H ({r24:.2f}) ~ Week ({r7:.2f})/Month ({r30:.2f})"
+def decide_signal_row(row, slope_val, min_gap):
+    """Tek satır için GİR sinyali koşulu."""
+    r24 = row.get("24H"); r7 = row.get("Week"); r30 = row.get("Month"); rtp = row.get("RTP")
+    if any(pd.isna([r24, r7, r30, rtp])): 
+        return False
+    up_ok   = (r24 - max(r7, r30)) >= min_gap and (r24 > rtp)
+    slope_ok = True if slope_val is None else (slope_val > 0)
+    return bool(up_ok and slope_ok)
 
-# 15 dk adımlarla (N=672) Week yakınsaması
-def project_week_15m(W_now: float, D_star: float, k_steps: int, N: int = 672):
-    decay = ((N - 1) / N) ** k_steps
-    return float(D_star + (W_now - D_star) * decay)
-
-# Saatlik yakınsama (basit üstel yaklaşım)
-def simulate_convergence(current: float, target: float, hours: int, decay_factor: float):
-    vals = []
-    val = current
-    for _ in range(hours + 1):
-        vals.append(val)
-        val += (target - val) * decay_factor
-    return vals
+def compute_slope_series(df, window_points):
+    """Basit eğim: (24H_now - 24H_prev) / dakika (prev = window_points-1 önceki ölçüm)."""
+    if window_points is None or window_points <= 1 or "24H" not in df.columns:
+        return pd.Series([None]*len(df), index=df.index)
+    prev = df["24H"].shift(window_points-1)
+    dtm  = (df["timestamp"] - df["timestamp"].shift(window_points-1)).dt.total_seconds()/60.0
+    slope = (df["24H"] - prev) / dtm
+    return slope
 
 # -------------------- basit login --------------------
 AUTH_USER = "mirzam43"
@@ -150,7 +142,7 @@ with colC:
 with st.sidebar:
     st.markdown("### 🎛️ Sinyal Ayarları")
     min_gap = st.number_input("Minimum fark (puan)", 0.0, 5.0, 0.3, 0.1)
-    slope_window = st.selectbox("24H eğim penceresi", ["Yok", 3, 5, 9], index=2)
+    slope_window_opt = st.selectbox("24H eğim penceresi", ["Yok", 3, 5, 9], index=2)
 
 # Veriyi yükle
 src, ref = catalog[game]
@@ -179,162 +171,118 @@ plot_df = gdf.loc[mask, ["timestamp", metric]].copy()
 if resample != "(yok)" and not plot_df.empty:
     plot_df = plot_df.set_index("timestamp").resample(resample).mean().reset_index()
 
-# -------------------- Sinyal --------------------
+# -------------------- Anlık sinyal --------------------
 base_sorted = gdf.sort_values("timestamp")
 last_row = base_sorted.tail(1).iloc[0]
 
-slope_24h = None
-if slope_window != "Yok" and "24H" in base_sorted.columns:
-    win = int(slope_window)
-    tmp = base_sorted[["timestamp","24H"]].dropna().tail(win)
+# anlık slope
+slope_window = None if slope_window_opt == "Yok" else int(slope_window_opt)
+slope_24h_now = None
+if slope_window is not None:
+    tmp = base_sorted[["timestamp","24H"]].dropna().tail(slope_window)
     if len(tmp) >= 2:
-        dt_min = (tmp["timestamp"].iloc[-1] - tmp["timestamp"].iloc[0]).total_seconds() / 60.0
+        dt_min = (tmp["timestamp"].iloc[-1] - tmp["timestamp"].iloc[0]).total_seconds()/60.0
         if dt_min > 0:
-            slope_24h = (tmp["24H"].iloc[-1] - tmp["24H"].iloc[0]) / dt_min
+            slope_24h_now = (tmp["24H"].iloc[-1] - tmp["24H"].iloc[0]) / dt_min
 
-signal, reason = decide_signal(last_row, slope_24h=slope_24h, min_gap=min_gap)
+def decide_signal_now(df_row, slope_24h=None, min_gap=0.3):
+    r24, r7, r30 = df_row.get("24H"), df_row.get("Week"), df_row.get("Month")
+    if any(pd.isna([r24, r7, r30])): return "UNKNOWN", "Veri eksik"
+    up_ok   = (r24 - max(r7, r30)) >= min_gap
+    down_ok = (min(r7, r30) - r24) >= min_gap
+    if up_ok and (slope_24h is None or slope_24h > 0):
+        return "BUY", f"24H ({r24:.2f}) > Week ({r7:.2f}) & Month ({r30:.2f})"
+    if down_ok and (slope_24h is None or slope_24h <= 0):
+        return "SELL", f"24H ({r24:.2f}) < Week ({r7:.2f}) & Month ({r30:.2f})"
+    return "HOLD", f"24H ({r24:.2f}) ~ Week ({r7:.2f})/Month ({r30:.2f})"
+
+signal_now, reason_now = decide_signal_now(last_row, slope_24h=slope_24h_now, min_gap=min_gap)
 
 st.subheader("📡 Anlık Sinyal")
-if signal == "BUY":
-    st.success(f"✅ GİR — {reason}" + (f" | Eğim: {slope_24h:+.3f}/dk" if slope_24h is not None else ""))
-elif signal == "SELL":
-    st.error(f"❌ ÇIK — {reason}" + (f" | Eğim: {slope_24h:+.3f}/dk" if slope_24h is not None else ""))
-elif signal == "HOLD":
-    st.warning(f"⏳ BEKLE — {reason}" + (f" | Eğim: {slope_24h:+.3f}/dk" if slope_24h is not None else ""))
+if signal_now == "BUY":
+    st.success(f"✅ GİR — {reason_now}" + (f" | Eğim: {slope_24h_now:+.3f}/dk" if slope_24h_now is not None else ""))
+elif signal_now == "SELL":
+    st.error(f"❌ ÇIK — {reason_now}" + (f" | Eğim: {slope_24h_now:+.3f}/dk" if slope_24h_now is not None else ""))
+elif signal_now == "HOLD":
+    st.warning(f"⏳ BEKLE — {reason_now}" + (f" | Eğim: {slope_24h_now:+.3f}/dk" if slope_24h_now is not None else ""))
 else:
     st.info("Veri yetersiz")
 
-# -------------------- Grafik --------------------
+# -------------------- Tek metrik grafik --------------------
 st.subheader(f"🎯 {game} — {metric}")
 if plot_df.empty or plot_df[metric].dropna().empty:
     st.info("Seçili filtre/metric için veri yok.")
 else:
     fig = px.line(plot_df, x="timestamp", y=metric, markers=True)
-    # sinyal anını (en güncel timestamp) işaretle (Timestamp -> datetime)
+    # sinyal anını shape ile işaretle (add_vline yerine)
     last_ts = base_sorted["timestamp"].max()
     if pd.notna(last_ts):
         x_val = last_ts.to_pydatetime() if isinstance(last_ts, pd.Timestamp) else last_ts
-        fig.add_vline(x=x_val, line_dash="dot")
+        fig.add_shape(type="line", x0=x_val, x1=x_val, y0=0, y1=1,
+                      xref="x", yref="paper", line=dict(dash="dot", width=1.5))
+        fig.add_annotation(x=x_val, y=1, xref="x", yref="paper",
+                           text="Sinyal anı", showarrow=False, yshift=10)
     st.plotly_chart(fig, use_container_width=True)
+
+# -------------------- ADioG: Tüm metrikler + geçmiş sinyal işaretleri --------------------
+st.subheader(f"🧪 ADioG — {game} (RTP gri, 24H kırmızı, Week lacivert, Month siyah)")
+
+adio_df = gdf.loc[mask, ["timestamp","RTP","24H","Week","Month"]].dropna().copy()
+if resample != "(yok)" and not adio_df.empty:
+    adio_df = (adio_df.set_index("timestamp")
+                      .resample(resample)
+                      .mean()
+                      .reset_index())
+
+if adio_df.empty:
+    st.info("ADioG için seçili tarih aralığında veri yok.")
+else:
+    # geçmiş eğim serisi (opsiyonel)
+    slope_series = compute_slope_series(adio_df, None if slope_window_opt == "Yok" else int(slope_window_opt))
+
+    # kurala göre giriş noktaları
+    entries = []
+    for i, row in adio_df.iterrows():
+        slope_val = None if pd.isna(slope_series.iloc[i]) else slope_series.iloc[i]
+        entries.append(decide_signal_row(row, slope_val, min_gap))
+    adio_df["ENTRY"] = entries
+
+    # grafik
+    fig_all = go.Figure()
+    fig_all.add_trace(go.Scatter(x=adio_df["timestamp"], y=adio_df["RTP"],
+                                 mode="lines", name="RTP", line=dict(color="#8c8c8c", width=1.5)))
+    fig_all.add_trace(go.Scatter(x=adio_df["timestamp"], y=adio_df["24H"],
+                                 mode="lines", name="24H", line=dict(color="#d62728", width=2)))
+    fig_all.add_trace(go.Scatter(x=adio_df["timestamp"], y=adio_df["Week"],
+                                 mode="lines", name="Week", line=dict(color="#1f77b4", width=2)))
+    fig_all.add_trace(go.Scatter(x=adio_df["timestamp"], y=adio_df["Month"],
+                                 mode="lines", name="Month", line=dict(color="#000000", width=2)))
+
+    sig_pts = adio_df.loc[adio_df["ENTRY"]]
+    if not sig_pts.empty:
+        fig_all.add_trace(go.Scatter(
+            x=sig_pts["timestamp"], y=sig_pts["24H"],
+            mode="markers", name="Giriş Sinyali",
+            marker=dict(color="#2ca02c", size=9, symbol="circle"),
+            hovertemplate="Giriş: %{x|%Y-%m-%d %H:%M}<br>24H=%{y:.2f}<extra></extra>"
+        ))
+
+    fig_all.update_layout(
+        margin=dict(l=10, r=10, t=30, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        xaxis_title="timestamp", yaxis_title="RTP / Yüzde"
+    )
+    st.plotly_chart(fig_all, use_container_width=True)
+
+    # özet
+    total_signals = int(adio_df["ENTRY"].sum())
+    last_signal_ts = sig_pts["timestamp"].iloc[-1] if total_signals > 0 else None
+    cA, cB = st.columns(2)
+    with cA:
+        st.metric("Toplam Giriş Sinyali", total_signals)
+    with cB:
+        st.metric("Son Giriş Sinyali", "-" if last_signal_ts is None else last_signal_ts.strftime("%Y-%m-%d %H:%M"))
 
 st.divider()
 st.subheader("🧾 Veri")
 st.dataframe(plot_df, use_container_width=True, hide_index=True)
-
-# ==================== ▶ SIMÜLASYON BUTONU (tetiklemeli) ====================
-st.markdown("---")
-run_sim = st.button("▶ Simülasyonu Çalıştır")
-
-if run_sim:
-    # --- Parametreler ---
-    base_rtp = float(last_row.get("RTP")) if "RTP" in last_row else None
-    curr_24h = float(last_row.get("24H")) if "24H" in last_row else None
-    curr_week = float(last_row.get("Week")) if "Week" in last_row else None
-    curr_month = float(last_row.get("Month")) if "Month" in last_row else None
-
-    if any(v is None for v in [base_rtp, curr_24h, curr_week, curr_month]):
-        st.info("Simülasyon için 24H / Week / Month / RTP sütunları gerekli.")
-    else:
-        st.subheader("🔮 Simülasyon")
-
-        # ---- A) 15 dk adımlarında Week yakınsaması (D* = son 24H) ----
-        st.markdown("**A) 15 dk Adımlarıyla Week Yakınsaması**")
-        cA1, cA2, cA3 = st.columns(3)
-        with cA1:
-            D_star = st.number_input("24H seviyesi (D*)", value=round(curr_24h, 2), step=0.1,
-                                     help="Gelecek ölçümlerde korunacağı varsayılan 24H seviyesi")
-        with cA2:
-            horizon_steps = st.slider("Ufuk (15 dk adım)", min_value=24, max_value=672, value=288,
-                                      help="672 adım ≈ 7 gün")
-        with cA3:
-            gap15 = st.number_input("Giriş eşiği (puan)", min_value=0.0, max_value=5.0,
-                                    value=float(min_gap), step=0.1)
-
-        last_ts = base_sorted["timestamp"].max()
-        steps = list(range(0, horizon_steps + 1))
-        rows = []
-        entry_step = None
-        direction = "up" if D_star >= curr_week else "down"
-
-        for k in steps:
-            Wk = project_week_15m(curr_week, D_star, k, N=672)
-            diff = D_star - Wk
-            ts_k = (last_ts + pd.Timedelta(minutes=15 * k)) if pd.notna(last_ts) else None
-            if entry_step is None:
-                if direction == "up" and diff >= gap15:
-                    entry_step = k
-                if direction == "down" and (-diff) >= gap15:
-                    entry_step = k
-            rows.append({
-                "Adım (15dk)": k,
-                "Zaman": ts_k,
-                "Proj. Week": round(Wk, 3),
-                "24H (D*)": round(D_star, 3),
-                "Fark (D*-W)": round(diff, 3)
-            })
-
-        sim15_df = pd.DataFrame(rows)
-        st.dataframe(
-            sim15_df[["Adım (15dk)", "Zaman", "Proj. Week", "24H (D*)", "Fark (D*-W)"]],
-            use_container_width=True, hide_index=True
-        )
-
-        x_col = "Zaman" if sim15_df["Zaman"].notna().any() else "Adım (15dk)"
-        fig_sim15 = px.line(sim15_df, x=x_col, y="Proj. Week", markers=True,
-                            title="Week projeksiyonu (15 dk adımlar)")
-        fig_sim15.add_hline(y=D_star, line_dash="dot",
-                            annotation_text="24H (D*)", annotation_position="top left")
-        if entry_step is not None:
-            x_val = sim15_df.loc[entry_step, x_col]
-            if isinstance(x_val, pd.Timestamp):
-                x_val = x_val.to_pydatetime()
-            fig_sim15.add_vline(x=x_val, line_dash="dot",
-                                annotation_text=f"Giriş: {entry_step} adım",
-                                annotation_position="top right")
-        if x_col == "Zaman":
-            fig_sim15.update_xaxes(type="date")
-        st.plotly_chart(fig_sim15, use_container_width=True)
-
-        if entry_step is None:
-            st.warning("15 dk simülasyonunda seçilen ufukta giriş eşiği oluşmadı.")
-        else:
-            eta = sim15_df.loc[entry_step, "Zaman"]
-            dur_text = f" (~{entry_step*15//60} saat {entry_step*15%60} dk)"
-            when_text = f", zaman: {eta.strftime('%Y-%m-%d %H:%M')}" if pd.notna(eta) else ""
-            st.success(
-                f"✅ 15 dk simülasyonu: **{entry_step} adım** sonra{dur_text}{when_text} giriş yapılabilir. "
-                f"Week ≈ {sim15_df.loc[entry_step, 'Proj. Week']:.2f}, "
-                f"fark ≈ {sim15_df.loc[entry_step, 'Fark (D*-W)']:.2f}."
-            )
-
-        st.markdown("---")
-
-        # ---- B) Saatlik yakınsama (24H/Week/Month → Orijinal RTP) ----
-        st.markdown("**B) Saatlik Yakınsama (Orijinal RTP'ye doğru)**")
-        cB1, cB2 = st.columns(2)
-        with cB1:
-            decay_pct = st.slider("Saatlik yakınsama oranı (%)", 5, 50, 25, step=5,
-                                  help="Her saatte farkın bu kadarı kapanır")
-        with cB2:
-            horizon_hours = st.slider("Ufuk (saat)", 1, 24, 6)
-
-        decay = decay_pct / 100.0
-        sim_24h = simulate_convergence(curr_24h, base_rtp, horizon_hours, decay)
-        sim_week = simulate_convergence(curr_week, base_rtp, horizon_hours, decay)
-        sim_month = simulate_convergence(curr_month, base_rtp, horizon_hours, decay)
-
-        simH_df = pd.DataFrame({
-            "Saat": list(range(horizon_hours + 1)),
-            "24H": sim_24h, "Week": sim_week, "Month": sim_month
-        })
-
-        figH = px.line(simH_df, x="Saat", y=["24H", "Week", "Month"],
-                       title="Saatlik RTP Yakınsama", markers=True)
-        figH.add_hline(y=base_rtp, line_dash="dot",
-                       annotation_text="Orijinal RTP", annotation_position="top left")
-        st.plotly_chart(figH, use_container_width=True)
-
-        if curr_24h > curr_week and curr_24h > curr_month and curr_24h > base_rtp:
-            st.success("✅ Saatlik model: Şu an verme eğiliminde (kısa vadede oynanabilir).")
-        else:
-            st.warning("⏳ Saatlik model: Güçlü bir verme eğilimi teyidi yok (beklemek mantıklı).")
