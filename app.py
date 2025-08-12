@@ -1,5 +1,5 @@
 # app.py
-import os, io, glob, base64, requests
+import os, io, glob, base64, time, requests
 from pathlib import Path
 from datetime import datetime
 
@@ -64,12 +64,16 @@ with st.sidebar:
 if not st.session_state.get("auth", False):
     st.stop()
 
-# -------------------- auto-refresh + manuel yenile --------------------
+# -------------------- auto-refresh + manuel yenile (cache-buster) --------------------
 st.components.v1.html("<meta http-equiv='refresh' content='120'>", height=0)
 with st.sidebar:
+    if "refresh_token" not in st.session_state:
+        st.session_state["refresh_token"] = 0
     if st.button("🔄 Veriyi yenile"):
+        st.session_state["refresh_token"] += 1  # cache anahtarı değişsin
         st.cache_data.clear()
         st.rerun()
+refresh_token = st.session_state.get("refresh_token", 0)
 
 # -------------------- GitHub'tan veri okuma --------------------
 OWNER  = get_secret("GH_OWNER",  "zorba43")
@@ -80,7 +84,10 @@ TOKEN  = get_secret("GITHUB_TOKEN", None)
 HEADERS = {"Authorization": f"token {TOKEN}"} if TOKEN else {}
 
 @st.cache_data(ttl=60)
-def list_csv_urls(owner, repo, path, branch, headers):
+def list_csv_urls(owner, repo, path, branch, headers, _refresh_token=0):
+    """
+    İçerik listesi – her zaman API content URL'sini döndür (raw CDN'ini atlatır).
+    """
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
     r = requests.get(url, headers=headers, timeout=20)
     if r.status_code != 200:
@@ -89,29 +96,38 @@ def list_csv_urls(owner, repo, path, branch, headers):
     out = {}
     for it in items:
         if it.get("type") == "file" and it["name"].lower().endswith(".csv"):
-            out[it["name"]] = it.get("download_url") or it.get("url")
+            # => API content URL
+            out[it["name"]] = it.get("url")
     return out
 
 @st.cache_data(ttl=60)
-def load_csv_from_github(url, headers):
-    if url.startswith("https://api.github.com/"):
+def load_csv_from_github(url, headers, _refresh_token=0):
+    """
+    API content URL ise base64 içerik; raw olursa cache-buster query ile çek.
+    """
+    if url and url.startswith("https://api.github.com/"):
         r = requests.get(url, headers=headers, timeout=20)
         r.raise_for_status()
         data = r.json()
         content = base64.b64decode(data["content"])
         return pd.read_csv(io.BytesIO(content), parse_dates=["timestamp"])
-    else:
-        r = requests.get(url, headers=headers, timeout=20)
-        r.raise_for_status()
-        return pd.read_csv(io.BytesIO(r.content), parse_dates=["timestamp"])
 
-csv_urls = list_csv_urls(OWNER, REPO, PATH, BRANCH, HEADERS)
+    # Fallback: raw link (CDN cache buster)
+    sep = "&" if url and "?" in url else "?"
+    url_cb = f"{url}{sep}_cb={int(time.time())}"
+    hdrs = dict(headers) if headers else {}
+    hdrs.update({"Cache-Control": "no-cache"})
+    r = requests.get(url_cb, headers=hdrs, timeout=20)
+    r.raise_for_status()
+    return pd.read_csv(io.BytesIO(r.content), parse_dates=["timestamp"])
+
+csv_urls = list_csv_urls(OWNER, REPO, PATH, BRANCH, HEADERS, refresh_token)
 catalog, data_source = {}, ""
 
 if csv_urls:
     for fname, url in sorted(csv_urls.items()):
         try:
-            df_tmp = load_csv_from_github(url, HEADERS)
+            df_tmp = load_csv_from_github(url, HEADERS, refresh_token)
             game_name = str(df_tmp.iloc[0]["game"]) if "game" in df_tmp.columns and not df_tmp.empty else fname.rsplit(".",1)[0]
             catalog[game_name] = ("github", url)
         except Exception as e:
@@ -147,7 +163,7 @@ with colB:
 with colC:
     resample = st.selectbox("Zaman aralığı (yeniden örnekleme)", ["(yok)", "15T", "30T", "1H", "4H", "1D"], index=0)
 
-# 🔧 Sinyal ayarları (gevşek varsayımlar)
+# 🔧 Sinyal ayarları (default gevşek)
 with st.sidebar:
     st.markdown("### 🎛️ Sinyal Ayarları")
     min_gap = st.number_input("Minimum fark (puan)", 0.0, 5.0, 0.20, 0.05)
@@ -155,11 +171,11 @@ with st.sidebar:
     use_slope = st.checkbox("Eğim şartı (24H artıyor olsun)", value=False)
     require_rtp = st.checkbox("24H > RTP şartı", value=False)
 
-# Veriyi yükle
+# -------------------- Veri yükle --------------------
 src, ref = catalog[game]
 try:
     if src == "github":
-        gdf = load_csv_from_github(ref, HEADERS)
+        gdf = load_csv_from_github(ref, HEADERS, refresh_token)
     else:
         gdf = pd.read_csv(ref, parse_dates=["timestamp"])
 except Exception as e:
@@ -168,7 +184,7 @@ except Exception as e:
 
 gdf = gdf.dropna(subset=["timestamp"]).sort_values("timestamp")
 
-# Tarih filtresi
+# -------------------- Tarih filtresi --------------------
 min_ts = gdf["timestamp"].min()
 max_ts = gdf["timestamp"].max()
 c1, c2 = st.columns(2)
