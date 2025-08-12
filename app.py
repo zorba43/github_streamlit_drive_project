@@ -17,23 +17,32 @@ def get_secret(key, default=None):
     except Exception:
         return os.environ.get(key, default)
 
-def decide_signal_row(row, slope_val, min_gap):
-    """Tek satır için GİR sinyali koşulu."""
-    r24 = row.get("24H"); r7 = row.get("Week"); r30 = row.get("Month"); rtp = row.get("RTP")
-    if any(pd.isna([r24, r7, r30, rtp])): 
-        return False
-    up_ok   = (r24 - max(r7, r30)) >= min_gap and (r24 > rtp)
-    slope_ok = True if slope_val is None else (slope_val > 0)
-    return bool(up_ok and slope_ok)
-
 def compute_slope_series(df, window_points):
-    """Basit eğim: (24H_now - 24H_prev) / dakika (prev = window_points-1 önceki ölçüm)."""
+    """Basit eğim: (24H_now - 24H_prev)/dakika (prev = window_points-1 önceki ölçüm)."""
     if window_points is None or window_points <= 1 or "24H" not in df.columns:
         return pd.Series([None]*len(df), index=df.index)
     prev = df["24H"].shift(window_points-1)
     dtm  = (df["timestamp"] - df["timestamp"].shift(window_points-1)).dt.total_seconds()/60.0
     slope = (df["24H"] - prev) / dtm
     return slope
+
+def decide_signal_row(row, slope_val, min_gap, use_slope=False, require_rtp=False):
+    """
+    Tek satır için GİR sinyali:
+      - 24H - max(Week, Month) >= min_gap
+      - (isteğe bağlı) 24H > RTP
+      - (isteğe bağlı) slope > 0
+    """
+    r24 = row.get("24H"); r7 = row.get("Week"); r30 = row.get("Month"); rtp = row.get("RTP")
+    if any(pd.isna([r24, r7, r30])): 
+        return False
+    up_ok = (r24 - max(r7, r30)) >= min_gap
+    if require_rtp and not pd.isna(rtp):
+        up_ok = up_ok and (r24 > rtp)
+    slope_ok = True
+    if use_slope:
+        slope_ok = (slope_val is not None and slope_val > 0)
+    return bool(up_ok and slope_ok)
 
 # -------------------- basit login --------------------
 AUTH_USER = "mirzam43"
@@ -138,11 +147,13 @@ with colB:
 with colC:
     resample = st.selectbox("Zaman aralığı (yeniden örnekleme)", ["(yok)", "15T", "30T", "1H", "4H", "1D"], index=0)
 
-# Sinyal ayarları
+# 🔧 Sinyal ayarları (gevşek varsayımlar)
 with st.sidebar:
     st.markdown("### 🎛️ Sinyal Ayarları")
-    min_gap = st.number_input("Minimum fark (puan)", 0.0, 5.0, 0.3, 0.1)
-    slope_window_opt = st.selectbox("24H eğim penceresi", ["Yok", 3, 5, 9], index=2)
+    min_gap = st.number_input("Minimum fark (puan)", 0.0, 5.0, 0.20, 0.05)
+    slope_window_opt = st.selectbox("24H eğim penceresi", ["Yok", 3, 5, 9], index=0)
+    use_slope = st.checkbox("Eğim şartı (24H artıyor olsun)", value=False)
+    require_rtp = st.checkbox("24H > RTP şartı", value=False)
 
 # Veriyi yükle
 src, ref = catalog[game]
@@ -175,7 +186,7 @@ if resample != "(yok)" and not plot_df.empty:
 base_sorted = gdf.sort_values("timestamp")
 last_row = base_sorted.tail(1).iloc[0]
 
-# anlık slope
+# anlık slope (opsiyonel)
 slope_window = None if slope_window_opt == "Yok" else int(slope_window_opt)
 slope_24h_now = None
 if slope_window is not None:
@@ -185,28 +196,26 @@ if slope_window is not None:
         if dt_min > 0:
             slope_24h_now = (tmp["24H"].iloc[-1] - tmp["24H"].iloc[0]) / dt_min
 
-def decide_signal_now(df_row, slope_24h=None, min_gap=0.3):
-    r24, r7, r30 = df_row.get("24H"), df_row.get("Week"), df_row.get("Month")
+def decide_signal_now(df_row, slope_24h=None, min_gap=0.3, use_slope=False, require_rtp=False):
+    r24, r7, r30, rtp = df_row.get("24H"), df_row.get("Week"), df_row.get("Month"), df_row.get("RTP")
     if any(pd.isna([r24, r7, r30])): return "UNKNOWN", "Veri eksik"
-    up_ok   = (r24 - max(r7, r30)) >= min_gap
-    down_ok = (min(r7, r30) - r24) >= min_gap
-    if up_ok and (slope_24h is None or slope_24h > 0):
-        return "BUY", f"24H ({r24:.2f}) > Week ({r7:.2f}) & Month ({r30:.2f})"
-    if down_ok and (slope_24h is None or slope_24h <= 0):
-        return "SELL", f"24H ({r24:.2f}) < Week ({r7:.2f}) & Month ({r30:.2f})"
-    return "HOLD", f"24H ({r24:.2f}) ~ Week ({r7:.2f})/Month ({r30:.2f})"
+    up_ok = (r24 - max(r7, r30)) >= min_gap
+    if require_rtp and not pd.isna(rtp):
+        up_ok = up_ok and (r24 > rtp)
+    slope_ok = True if not use_slope else (slope_24h is not None and slope_24h > 0)
+    if up_ok and slope_ok:  return "BUY", f"24H {r24:.2f} > max(Week,Month) + {min_gap}"
+    return "HOLD", f"Koşullar sağlanmadı"
 
-signal_now, reason_now = decide_signal_now(last_row, slope_24h=slope_24h_now, min_gap=min_gap)
+signal_now, reason_now = decide_signal_now(
+    last_row, slope_24h=slope_24h_now, min_gap=min_gap,
+    use_slope=use_slope, require_rtp=require_rtp
+)
 
 st.subheader("📡 Anlık Sinyal")
 if signal_now == "BUY":
     st.success(f"✅ GİR — {reason_now}" + (f" | Eğim: {slope_24h_now:+.3f}/dk" if slope_24h_now is not None else ""))
-elif signal_now == "SELL":
-    st.error(f"❌ ÇIK — {reason_now}" + (f" | Eğim: {slope_24h_now:+.3f}/dk" if slope_24h_now is not None else ""))
-elif signal_now == "HOLD":
-    st.warning(f"⏳ BEKLE — {reason_now}" + (f" | Eğim: {slope_24h_now:+.3f}/dk" if slope_24h_now is not None else ""))
 else:
-    st.info("Veri yetersiz")
+    st.warning(f"⏳ BEKLE — {reason_now}")
 
 # -------------------- Tek metrik grafik --------------------
 st.subheader(f"🎯 {game} — {metric}")
@@ -214,7 +223,6 @@ if plot_df.empty or plot_df[metric].dropna().empty:
     st.info("Seçili filtre/metric için veri yok.")
 else:
     fig = px.line(plot_df, x="timestamp", y=metric, markers=True)
-    # sinyal anını shape ile işaretle (add_vline yerine)
     last_ts = base_sorted["timestamp"].max()
     if pd.notna(last_ts):
         x_val = last_ts.to_pydatetime() if isinstance(last_ts, pd.Timestamp) else last_ts
@@ -224,7 +232,7 @@ else:
                            text="Sinyal anı", showarrow=False, yshift=10)
     st.plotly_chart(fig, use_container_width=True)
 
-# -------------------- ADioG: Tüm metrikler + geçmiş sinyal işaretleri --------------------
+# -------------------- ADioG: Tüm metrikler + geçmiş sinyaller --------------------
 st.subheader(f"🧪 ADioG — {game} (RTP gri, 24H kırmızı, Week lacivert, Month siyah)")
 
 adio_df = gdf.loc[mask, ["timestamp","RTP","24H","Week","Month"]].dropna().copy()
@@ -237,17 +245,14 @@ if resample != "(yok)" and not adio_df.empty:
 if adio_df.empty:
     st.info("ADioG için seçili tarih aralığında veri yok.")
 else:
-    # geçmiş eğim serisi (opsiyonel)
-    slope_series = compute_slope_series(adio_df, None if slope_window_opt == "Yok" else int(slope_window_opt))
-
-    # kurala göre giriş noktaları
+    slope_series = compute_slope_series(adio_df, slope_window if use_slope else None)
     entries = []
     for i, row in adio_df.iterrows():
         slope_val = None if pd.isna(slope_series.iloc[i]) else slope_series.iloc[i]
-        entries.append(decide_signal_row(row, slope_val, min_gap))
+        entries.append(decide_signal_row(row, slope_val, min_gap,
+                                         use_slope=use_slope, require_rtp=require_rtp))
     adio_df["ENTRY"] = entries
 
-    # grafik
     fig_all = go.Figure()
     fig_all.add_trace(go.Scatter(x=adio_df["timestamp"], y=adio_df["RTP"],
                                  mode="lines", name="RTP", line=dict(color="#8c8c8c", width=1.5)))
@@ -274,7 +279,6 @@ else:
     )
     st.plotly_chart(fig_all, use_container_width=True)
 
-    # özet
     total_signals = int(adio_df["ENTRY"].sum())
     last_signal_ts = sig_pts["timestamp"].iloc[-1] if total_signals > 0 else None
     cA, cB = st.columns(2)
