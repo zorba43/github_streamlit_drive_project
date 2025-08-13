@@ -1,60 +1,83 @@
 name: collect
 
 on:
+  # Elle çalıştırma
   workflow_dispatch: {}
- # schedule:
-    # Her 15 dakikada bir (UTC)
-   # - cron: "*/15 * * * *"
+  # Her 15 dakikada bir otomatik çalıştırma
+  schedule:
+    - cron: "*/15 * * * *"
 
-permissions:
-  contents: write  # commit/push için gerekli
-
+# Aynı anda birden fazla run çakışmasın
 concurrency:
   group: collect
   cancel-in-progress: true
 
+permissions:
+  contents: write
+
 jobs:
   collect:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # diff/commit için geçmiş gerekli
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
-          pip install pandas google-api-python-client google-auth google-auth-oauthlib google-auth-httplib2 openpyxl
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Run collector (Drive → Scraper Data → data/normalized)
+      # Service Account JSON'u secrets'tan dosyaya yaz
+      - name: Write service account file
         env:
-          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
         run: |
-          python ci/collector_gdrive_ci.py
+          if [ -z "${GOOGLE_SERVICE_ACCOUNT_JSON}" ]; then
+            echo "GOOGLE_SERVICE_ACCOUNT_JSON boş! Repo > Settings > Secrets > Actions kısmına ekleyin." >&2
+            exit 1
+          fi
+          echo "$GOOGLE_SERVICE_ACCOUNT_JSON" > /tmp/sa.json
+          python - <<'PY'
+import json,sys
+j=json.load(open("/tmp/sa.json"))
+assert "client_email" in j and "private_key" in j, "Service account JSON hatalı görünüyor"
+print("Service account OK.")
+PY
+
+      # Google Drive'dan veriyi indir + normalize et
+      - name: Run collector (Drive → data/normalized)
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: /tmp/sa.json
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+        run: |
+          if [ -z "${DRIVE_FOLDER_ID}" ]; then
+            echo "DRIVE_FOLDER_ID boş! Repo > Settings > Secrets > Actions kısmına ekleyin." >&2
+            exit 1
+          fi
+
+          # (Projedeki scripti çalıştır)
+          python ci/collector_gdrive_ci.py --folder-id "$DRIVE_FOLDER_ID"
 
       - name: Show normalized files (diagnostic)
         run: |
-          echo "---- data/normalized ----"
-          ls -lah data/normalized || true
+          echo "---- data/normalized"
+          ls -la data/normalized || true
 
-      - name: Commit & push data changes (if any)
+      - name: Commit & push data changes
         run: |
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add -A data/normalized
-
-          # Yalnızca değişiklik varsa commit et
-          if ! git diff --cached --quiet; then
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Değişiklik yok, commit atılmadı."
+          else
             git commit -m "Mirror & normalize Drive to data/ [skip ci]"
             git push
-          else
-            echo "No changes to commit."
           fi
