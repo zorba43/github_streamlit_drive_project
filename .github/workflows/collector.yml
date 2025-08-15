@@ -1,8 +1,8 @@
 name: collect
 
 on:
-  schedule:
-    - cron: "*/15 * * * *"   # Her 15 dakikada bir
+ # schedule:
+  #  - cron: "*/15 * * * *"   # Her 15 dakikada bir
   workflow_dispatch:        # Manuel tetikleme
 
 jobs:
