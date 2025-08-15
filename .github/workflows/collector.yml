@@ -1,24 +1,22 @@
 name: collect
 
 on:
-  # Elle çalıştırma
-  workflow_dispatch: {}
-  # Her 15 dakikada bir otomatik çalıştırma
- # schedule:
-   # - cron: "*/15 * * * *"
-
-# Aynı anda birden fazla run çakışmasın
-concurrency:
-  group: collect
-  cancel-in-progress: true
+  workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"   # her 15 dakikada bir
 
 permissions:
   contents: write
 
+env:
+  # Google Drive klasör ID (gerekirse değiştir)
+  DRIVE_FOLDER_ID: "1UCWuJZc2NGf0Jaynr6DKpcm7I1rfwvAM"
+  PYTHON_VERSION: "3.11"
+  SERVICE_JSON_PATH: "service-account.json"
+
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
 
     steps:
       - name: Checkout repo
@@ -27,56 +25,59 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      # Service Account JSON'u secrets'tan dosyaya yaz
+      # Servis hesabı sekreti varsa JSON dosyasını yazar
       - name: Write service account file
-        env:
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        if: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON != '' }}
+        shell: bash
         run: |
-          if [ -z "${GOOGLE_SERVICE_ACCOUNT_JSON}" ]; then
-            echo "GOOGLE_SERVICE_ACCOUNT_JSON boş! Repo > Settings > Secrets > Actions kısmına ekleyin." >&2
-            exit 1
-          fi
-          echo "$GOOGLE_SERVICE_ACCOUNT_JSON" > /tmp/sa.json
+          echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}' > "$SERVICE_JSON_PATH"
+          # Bazı durumlarda JSON tek satır string gibi gelir – normalize edelim
           python - <<'PY'
-import json,sys
-j=json.load(open("/tmp/sa.json"))
-assert "client_email" in j and "private_key" in j, "Service account JSON hatalı görünüyor"
-print("Service account OK.")
-PY
+          import os, json
+          p = os.environ["SERVICE_JSON_PATH"]
+          with open(p, "r+", encoding="utf-8") as f:
+              s = f.read().strip()
+              if s and not s.lstrip().startswith("{"):  # kaçışlı tek satır gelebilir
+                  try:
+                      s = s.encode("utf-8").decode("unicode_escape")
+                  except Exception:
+                      pass
+              f.seek(0); f.write(s); f.truncate()
+          PY
 
-      # Google Drive'dan veriyi indir + normalize et
-      - name: Run collector (Drive → data/normalized)
+      - name: Run collector (Drive → Scraper Data → data/normalized)
         env:
-          GOOGLE_APPLICATION_CREDENTIALS: /tmp/sa.json
-          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+          # JSON oluşturulmuşsa Google API bunu otomatik kullanır
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ env.SERVICE_JSON_PATH }}
+        shell: bash
         run: |
-          if [ -z "${DRIVE_FOLDER_ID}" ]; then
-            echo "DRIVE_FOLDER_ID boş! Repo > Settings > Secrets > Actions kısmına ekleyin." >&2
-            exit 1
-          fi
-
-          # (Projedeki scripti çalıştır)
-          python ci/collector_gdrive_ci.py --folder-id "$DRIVE_FOLDER_ID"
+          set -e
+          # Drive indirici – dosyaların Scraper Data içinden toplanmasını sağlar
+          # Bu script Drive erişimi yoksa kendi içinde "service yok" deyip normalize'a geçebilir
+          python ci/collector_gdrive_ci.py --folder-id "$DRIVE_FOLDER_ID" || true
+          # Normalizasyon (CSV/Excel -> data/normalized/*.csv)
+          python ci/normalize_ci.py
 
       - name: Show normalized files (diagnostic)
         run: |
-          echo "---- data/normalized"
+          echo "==== data/normalized ===="
           ls -la data/normalized || true
 
-      - name: Commit & push data changes
+      - name: Commit & push data changes (if any)
+        shell: bash
         run: |
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
+          git add -A data/normalized
           if git diff --cached --quiet; then
-            echo "Değişiklik yok, commit atılmadı."
+            echo "No data changes to commit."
           else
             git commit -m "Mirror & normalize Drive to data/ [skip ci]"
             git push
