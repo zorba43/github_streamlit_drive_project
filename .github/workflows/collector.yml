@@ -1,34 +1,31 @@
 name: collect
 
 on:
-  # Her 15 dakikada bir çalıştır
   schedule:
-    - cron: "*/15 * * * *"
-  # Manuel çalıştırma
-  workflow_dispatch:
-  # Workflow dosyası veya CI dosyaları değişince de koşsun (opsiyonel)
-  push:
-    paths:
-      - ".github/workflows/collector.yml"
-      - "ci/**"
-
-# Aynı anda tek job çalışsın, üst üste binmesin
-concurrency:
-  group: collect
-  cancel-in-progress: true
+    - cron: "*/15 * * * *"   # Her 15 dakikada bir
+  workflow_dispatch:        # Manuel tetikleme
 
 jobs:
   collect:
-    # Secrets doğru tanımlı değilse job hiç başlamasın
-    if: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON != '' && secrets.DRIVE_FOLDER_ID != '' }}
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # veri değişikliklerini push edebilmek için
+      contents: write        # data/ altını commit/push edebilmek için
+
+    # Secrets'ı env'e bağla (expression değil, env)
+    env:
+      DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+      GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
 
     steps:
       - name: Checkout repo
-      # v4 kullanılabilir (GitHub resmi)
         uses: actions/checkout@v4
+
+      - name: Fail fast if secrets are missing
+        run: |
+          if [ -z "$GOOGLE_SERVICE_ACCOUNT_JSON" ] || [ -z "$DRIVE_FOLDER_ID" ]; then
+            echo "::error::Missing secrets. Please set DRIVE_FOLDER_ID and GOOGLE_SERVICE_ACCOUNT_JSON in Repo → Settings → Secrets and variables → Actions."
+            exit 1
+          fi
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -42,8 +39,7 @@ jobs:
 
       - name: Write service account file
         run: |
-          echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}' > service_account.json
-          # Basit doğrulama: JSON geçerli mi
+          echo "$GOOGLE_SERVICE_ACCOUNT_JSON" > service_account.json
           python - <<'PY'
           import json,sys
           try:
@@ -54,11 +50,8 @@ jobs:
           PY
 
       - name: Run collector (Drive → data/raw + data/normalized)
-        env:
-          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
         run: |
-          # Collector script'in senin repodaki yerleşimine göre
-          # yolu değiştirme ihtiyacı olabilir.
+          # Script yolun repoda farklıysa bu hattı değiştir
           python ci/collector_gdrive_ci.py --folder-id "$DRIVE_FOLDER_ID"
 
       - name: Show normalized files (diagnostic)
