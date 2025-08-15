@@ -1,81 +1,84 @@
 name: collect
 
 on:
-  workflow_dispatch:
+  # Her 15 dakikada bir çalıştır
   schedule:
-    - cron: "*/15 * * * *"   # her 15 dakikada bir
+    - cron: "*/15 * * * *"
+  # Manuel çalıştırma
+  workflow_dispatch:
+  # Workflow dosyası veya CI dosyaları değişince de koşsun (opsiyonel)
+  push:
+    paths:
+      - ".github/workflows/collector.yml"
+      - "ci/**"
 
-permissions:
-  contents: write
-
-env:
-  # Google Drive klasör ID (gerekirse değiştir)
-  DRIVE_FOLDER_ID: "1UCWuJZc2NGf0Jaynr6DKpcm7I1rfwvAM"
-  PYTHON_VERSION: "3.11"
-  SERVICE_JSON_PATH: "service-account.json"
+# Aynı anda tek job çalışsın, üst üste binmesin
+concurrency:
+  group: collect
+  cancel-in-progress: true
 
 jobs:
   collect:
+    # Secrets doğru tanımlı değilse job hiç başlamasın
+    if: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON != '' && secrets.DRIVE_FOLDER_ID != '' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # veri değişikliklerini push edebilmek için
 
     steps:
       - name: Checkout repo
+      # v4 kullanılabilir (GitHub resmi)
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install -r requirements.txt
 
-      # Servis hesabı sekreti varsa JSON dosyasını yazar
       - name: Write service account file
-        if: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON != '' }}
-        shell: bash
         run: |
-          echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}' > "$SERVICE_JSON_PATH"
-          # Bazı durumlarda JSON tek satır string gibi gelir – normalize edelim
+          echo '${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}' > service_account.json
+          # Basit doğrulama: JSON geçerli mi
           python - <<'PY'
-          import os, json
-          p = os.environ["SERVICE_JSON_PATH"]
-          with open(p, "r+", encoding="utf-8") as f:
-              s = f.read().strip()
-              if s and not s.lstrip().startswith("{"):  # kaçışlı tek satır gelebilir
-                  try:
-                      s = s.encode("utf-8").decode("unicode_escape")
-                  except Exception:
-                      pass
-              f.seek(0); f.write(s); f.truncate()
+          import json,sys
+          try:
+              json.load(open("service_account.json","r",encoding="utf-8"))
+          except Exception as e:
+              sys.exit(f"Service account JSON invalid: {e}")
+          print("Service account JSON OK")
           PY
 
-      - name: Run collector (Drive → Scraper Data → data/normalized)
+      - name: Run collector (Drive → data/raw + data/normalized)
         env:
-          # JSON oluşturulmuşsa Google API bunu otomatik kullanır
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ env.SERVICE_JSON_PATH }}
-        shell: bash
+          DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
         run: |
-          set -e
-          # Drive indirici – dosyaların Scraper Data içinden toplanmasını sağlar
-          # Bu script Drive erişimi yoksa kendi içinde "service yok" deyip normalize'a geçebilir
-          python ci/collector_gdrive_ci.py --folder-id "$DRIVE_FOLDER_ID" || true
-          # Normalizasyon (CSV/Excel -> data/normalized/*.csv)
-          python ci/normalize_ci.py
+          # Collector script'in senin repodaki yerleşimine göre
+          # yolu değiştirme ihtiyacı olabilir.
+          python ci/collector_gdrive_ci.py --folder-id "$DRIVE_FOLDER_ID"
 
       - name: Show normalized files (diagnostic)
+        if: always()
         run: |
-          echo "==== data/normalized ===="
+          echo "::group::normalized listing"
           ls -la data/normalized || true
+          echo "::endgroup::"
+          echo "::group::peek first rows"
+          for f in data/normalized/*.csv; do
+            echo "==== $f ===="
+            head -n 20 "$f" || true
+          done
+          echo "::endgroup::"
 
-      - name: Commit & push data changes (if any)
-        shell: bash
+      - name: Commit & push data changes
         run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A data/normalized
+          git config user.name  "data-bot"
+          git config user.email "data-bot@users.noreply.github.com"
+          git add -A data/
           if git diff --cached --quiet; then
             echo "No data changes to commit."
           else
